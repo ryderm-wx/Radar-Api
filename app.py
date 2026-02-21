@@ -1,6 +1,8 @@
 # app.py
 from flask import Flask, request, jsonify, Response, send_file
 from flask_cors import CORS
+from flask_compress import Compress  # <--- NEW IMPORT
+import gc  # <--- NEW IMPORT
 import sys
 import os
 import time
@@ -32,6 +34,7 @@ except Exception:
 
 app = Flask(__name__)
 CORS(app)
+Compress(app)  # <--- Enable GZIP compression for all routes
 
 NEXRAD_BUCKET_BASE = "https://unidata-nexrad-level3.s3.amazonaws.com"
 NEXRAD_LEVEL2_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/radar/nexrad_level2"
@@ -51,7 +54,7 @@ MRMS_BUCKET_BASE = "https://noaa-mrms-pds.s3.amazonaws.com"
 MRMS_PRODUCT_PATH = "CONUS/SeamlessHSR_00.00"
 HRRR_IDX_CACHE_TTL = 60
 HRRR_MAX_FORECAST_HOUR = 48
-HRRR_PROCESSED_CACHE_MAX_SIZE = 24
+HRRR_PROCESSED_CACHE_MAX_SIZE = 2
 HRRR_REFC_MIN_DBZ = 0.0
 HRRR_DEFAULT_LOOKBACK_HOURS = 48
 HRRR_DEFAULT_RUNS_MAX = 12
@@ -106,9 +109,9 @@ level2_download_locks = {}
 level2_download_locks_lock = Lock()
 
 # Cache for processed WebGL data to avoid reprocessing
-processed_data_cache = {}
+processed_data_cache = OrderedDict()
 processed_data_lock = Lock()
-PROCESSED_CACHE_MAX_SIZE = 50  # Keep last 50 processed radar scans
+PROCESSED_CACHE_MAX_SIZE = 5  # Keep last 5 processed radar scans (Railway friendly)
 
 LEVEL2_SWEEP_REQUIRED_COVERAGE_DEG = 359.0  # require near-complete 360° sweep
 
@@ -1950,16 +1953,9 @@ def stream_level2_rays():
 
                         formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
 
-                        # Encode binary arrays as base64 to avoid slow JSON list serialization
-                        try:
-                            v_bytes = memoryview(vertices).tobytes()
-                            vals_bytes = memoryview(values).tobytes()
-                            v_b64 = base64.b64encode(v_bytes).decode('ascii')
-                            vals_b64 = base64.b64encode(vals_bytes).decode('ascii')
-                        except Exception:
-                            # Fallback to list serialization if something goes wrong
-                            v_b64 = None
-                            vals_b64 = None
+                        # Do NOT inline heavy binary payloads in SSE. Tell client to fetch optimized binary.
+                        v_b64 = None
+                        vals_b64 = None
 
                         # determine current sweep azimuth (head) if available
                         try:
@@ -1980,22 +1976,10 @@ def stream_level2_rays():
                             'sweepComplete': bool(coverage_deg >= 359.5),
                             'sweepRays': int(len(scan.get('azimuths', []))),
                             'totalBytes': int(monitor.downloaded_bytes),
+                            # Heavy payload removed to save egress and memory.
+                            # Client should fetch binary blob via /api/radar-webgl/<site>
+                            'fetchRequired': True,
                         }
-
-                        if v_b64 is not None and vals_b64 is not None:
-                            data.update({
-                                'verticesB64': v_b64,
-                                'verticesDtype': str(vertices.dtype),
-                                'verticesCount': int(vertices.size),
-                                'valuesB64': vals_b64,
-                                'valuesDtype': str(values.dtype),
-                                'valuesCount': int(values.size),
-                            })
-                        else:
-                            data.update({
-                                'vertices': vertices.tolist() if hasattr(vertices, 'tolist') else list(vertices),
-                                'values': values.tolist() if hasattr(values, 'tolist') else list(values),
-                            })
 
                         yield f"data: {json.dumps(data)}\n\n"
 
@@ -2037,14 +2021,9 @@ def stream_level2_rays():
                                 continue
 
                             formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
-                            try:
-                                v_bytes = memoryview(vertices).tobytes()
-                                vals_bytes = memoryview(values).tobytes()
-                                v_b64 = base64.b64encode(v_bytes).decode('ascii')
-                                vals_b64 = base64.b64encode(vals_bytes).decode('ascii')
-                            except Exception:
-                                v_b64 = None
-                                vals_b64 = None
+                            # Do not send base64 payload over SSE; let client fetch binary separately
+                            v_b64 = None
+                            vals_b64 = None
 
                             try:
                                 sweep_az2 = float(scan.get('azimuths', [])[-1]) if scan.get('azimuths') else None
@@ -2064,22 +2043,9 @@ def stream_level2_rays():
                                 'sweepComplete': bool(coverage_deg >= 359.5),
                                 'sweepRays': int(len(scan.get('azimuths', []))),
                                 'totalBytes': int(monitor.downloaded_bytes),
+                                # Heavy payload removed; client should call /api/radar-webgl to fetch blob
+                                'fetchRequired': True,
                             }
-
-                            if v_b64 is not None and vals_b64 is not None:
-                                rdata.update({
-                                    'verticesB64': v_b64,
-                                    'verticesDtype': str(vertices.dtype),
-                                    'verticesCount': int(vertices.size),
-                                    'valuesB64': vals_b64,
-                                    'valuesDtype': str(values.dtype),
-                                    'valuesCount': int(values.size),
-                                })
-                            else:
-                                rdata.update({
-                                    'vertices': vertices.tolist() if hasattr(vertices, 'tolist') else list(vertices),
-                                    'values': values.tolist() if hasattr(values, 'tolist') else list(values),
-                                })
 
                             yield f"data: {json.dumps(rdata)}\n\n"
 
@@ -2112,6 +2078,11 @@ def get_radar_data_webgl(site_id):
     source = _normalize_radar_source(request.args.get('source', 'level3'))
     
     t_start = time.time()
+    # Aggressive temp cleanup to avoid disk bloat on constrained hosts
+    try:
+        cleanup_temp_files()
+    except Exception:
+        pass
     try:
         # If a specific key is provided, use it; otherwise get the latest
         t_key = time.time()
@@ -2136,20 +2107,17 @@ def get_radar_data_webgl(site_id):
         cache_key = f"{source}:{site_id}:{product}:{key}:{file_size}:{file_mtime}"
         print(f"⏱️  Key lookup + download: {(time.time() - t_key)*1000:.1f}ms")
         
-        # Check if we already have processed data for this radar scan
+        # CHECK CACHE: cache now stores GZIPPED BYTES, not raw arrays
         with processed_data_lock:
             if cache_key in processed_data_cache:
                 print(f"🚀 Using cached processed data for {cache_key}")
-                vertices, values = processed_data_cache[cache_key]
+                compressed_blob = processed_data_cache[cache_key]
                 print(f"⏱️  TOTAL (cached): {(time.time() - t_start)*1000:.1f}ms")
-                
+
                 if format_type == 'binary':
-                    return create_binary_response(vertices, values)
+                    return create_binary_response_from_blob(compressed_blob)
                 else:
-                    # Convert numpy arrays to lists for JSON serialization
-                    vertices_list = vertices.tolist() if hasattr(vertices, 'tolist') else list(vertices)
-                    values_list = values.tolist() if hasattr(values, 'tolist') else list(values)
-                    return jsonify({"vertices": vertices_list, "values": values_list})
+                    return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
         
         # Process the radar data
         t_parse = time.time()
@@ -2197,66 +2165,63 @@ def get_radar_data_webgl(site_id):
             vertices, values = convert_radar_to_webgl_data(radar_data, site_id, product)
         print(f"⏱️  Convert to WebGL: {(time.time() - t_convert)*1000:.1f}ms")
         
-        # Cache the processed data
-        with processed_data_lock:
-            processed_data_cache[cache_key] = (vertices, values)
-            # Limit cache size
-            if len(processed_data_cache) > PROCESSED_CACHE_MAX_SIZE:
-                oldest_key = next(iter(processed_data_cache))
-                del processed_data_cache[oldest_key]
-        
+        # 2. GENERATE BLOB & CACHE
+        try:
+            compressed_blob = generate_binary_blob(vertices, values)
+
+            # Free raw arrays immediately
+            try:
+                del vertices
+                del values
+            except Exception:
+                pass
+            gc.collect()
+
+            with processed_data_lock:
+                processed_data_cache[cache_key] = compressed_blob
+                # Prune cache (OrderedDict)
+                if len(processed_data_cache) > PROCESSED_CACHE_MAX_SIZE:
+                    processed_data_cache.popitem(last=False)
+        except Exception as e:
+            print(f"❌ Failed to generate binary blob: {e}")
+            return jsonify({"error": "Failed to generate binary blob"}), 500
         print(f"⏱️  TOTAL (uncached): {(time.time() - t_start)*1000:.1f}ms")
-        
-        # OPTIMIZATION: Binary format is 5-10x faster than JSON!
+
         if format_type == 'binary':
-            return create_binary_response(vertices, values)
+            return create_binary_response_from_blob(compressed_blob)
         else:
-            # Fallback to JSON (slower but compatible)
-            # Convert numpy arrays to lists for JSON serialization
-            vertices_list = vertices.tolist() if hasattr(vertices, 'tolist') else list(vertices)
-            values_list = values.tolist() if hasattr(values, 'tolist') else list(values)
-            return jsonify({
-                "vertices": vertices_list,
-                "values": values_list
-            })
+            return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
-def create_binary_response(vertices, values, extra_headers=None):
+def generate_binary_blob(vertices, values):
     """
-    Create a binary response with radar data.
-    Format: [vertexCount (uint32)] [vertices (float32[])] [values (float32[])]
-    This is 5-10x faster than JSON for large datasets!
+    Generates the compressed binary blob from numpy arrays.
+    Returns: bytes (gzipped)
     """
     import struct
     import gzip
-    
-    # Convert to numpy arrays if they aren't already
+
+    # Ensure float32
     vertices_array = np.array(vertices, dtype=np.float32)
     values_array = np.array(values, dtype=np.float32)
-    
+
     vertex_count = len(values_array)
-    
-    # Build binary data
-    # 1. Write vertex count (4 bytes, uint32)
+
+    # 1. Vertex count
     binary_data = bytearray(struct.pack('<I', vertex_count))
-    
-    # 2. Write vertices array (float32 array)
+    # 2. Vertices
     binary_data.extend(vertices_array.tobytes())
-    
-    # 3. Write values array (float32 array)
+    # 3. Values
     binary_data.extend(values_array.tobytes())
-    
-    # Convert bytearray to bytes for Flask/Werkzeug
-    binary_bytes = bytes(binary_data)
-    
-    # OPTIMIZATION: Compress with gzip (70-80% size reduction!)
-    compressed_bytes = gzip.compress(binary_bytes, compresslevel=6)
-    
-    print(f"✅ Binary response: {len(binary_bytes)} bytes → {len(compressed_bytes)} bytes compressed ({vertex_count} vertices)")
-    print(f"   Compression ratio: {100 * (1 - len(compressed_bytes)/len(binary_bytes)):.1f}% smaller")
-    
+
+    # Compress immediately to save RAM
+    return gzip.compress(bytes(binary_data), compresslevel=6)
+
+
+def create_binary_response_from_blob(compressed_bytes, extra_headers=None):
+    """Wraps cached compressed bytes into a Flask Response."""
     response_headers = {
         'Content-Type': 'application/octet-stream',
         'Content-Encoding': 'gzip',
@@ -2270,6 +2235,32 @@ def create_binary_response(vertices, values, extra_headers=None):
         mimetype='application/octet-stream',
         headers=response_headers
     )
+
+
+def cleanup_temp_files():
+    """Removes files in ./temp older than 5 minutes."""
+    temp_path = Path("./temp")
+    if not temp_path.exists():
+        return
+    
+    now = time.time()
+    try:
+        for p in temp_path.rglob("*"):
+            if p.is_file():
+                # Delete if older than 5 mins
+                if now - p.stat().st_mtime > 300:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+# Backwards-compatible helper for existing call sites: builds blob then response
+def create_binary_response(vertices, values, extra_headers=None):
+    compressed = generate_binary_blob(vertices, values)
+    return create_binary_response_from_blob(compressed, extra_headers=extra_headers)
 
 
 def _normalize_hrrr_date(date_str):
