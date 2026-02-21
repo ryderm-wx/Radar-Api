@@ -1,0 +1,6 @@
+flask
+gunicorn
+numpy
+xarray
+cfgrib
+eccodes
