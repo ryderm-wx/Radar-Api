@@ -1,6 +1,8 @@
 flask
+flask-cors
 gunicorn
 numpy
-xarray
+pyproj
+metpy
 cfgrib
-eccodes
+xarray
