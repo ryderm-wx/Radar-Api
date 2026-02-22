@@ -555,7 +555,7 @@ def get_latest_radar_key(site_id, product, date=None):
 
     if last_known_key:
         try:
-            incremental = _list_radar_keys(prefix, max_keys=1, start_after=last_known_key)
+            incremental = _list_radar_keys(prefix, max_keys=50, start_after=last_known_key)
         except Exception:
             incremental = []
 
