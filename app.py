@@ -1894,10 +1894,22 @@ def stream_level2_rays():
     elevation = float(request.args.get('elevation', '0.5'))
     # Default to 0.5s polling for lower-latency updates (can be overriden with ?interval=...)
     check_interval = max(0.5, float(request.args.get('interval', 3)))
+    # Rotate long-lived SSE responses before sync-worker timeout kills the worker.
+    # EventSource clients will reconnect automatically.
+    stream_max_seconds = float(os.getenv('SSE_STREAM_MAX_SECONDS', '45'))
+    stream_max_seconds = max(10.0, min(300.0, stream_max_seconds))
+
+    def _should_rotate(started_at):
+        return (time.monotonic() - started_at) >= stream_max_seconds
 
     def generate():
+        started_at = time.monotonic()
         try:
             while True:
+                if _should_rotate(started_at):
+                    yield "event: stream-rotate\ndata: {\"reason\":\"pre-timeout-rotate\"}\n\n"
+                    return
+
                 # 1. ALWAYS check for the latest filename inside the loop
                 try:
                     files = _fetch_level2_dirlist(site_id)
@@ -1935,27 +1947,13 @@ def stream_level2_rays():
                     # scan appears partial (coverage < 360°), enter a short rapid-fetch
                     # mode to pull the remaining rays quickly.
                     for scan in new_payload['scans']:
-                        class _Level2Adapter: pass
-                        adapter = _Level2Adapter()
-                        adapter.level2_arrays = (scan['azimuths'], scan['ranges'], scan['values'])
-
                         # Compute azimuth coverage (client uses this to animate sweep)
                         try:
                             coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
                         except Exception:
                             coverage_deg = 0.0
 
-                        try:
-                            vertices, values = convert_radar_to_webgl_data(adapter, site_id, product)
-                        except Exception as e:
-                            print(f"⚠️  Failed to convert scan to WebGL: {e}")
-                            continue
-
                         formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
-
-                        # Do NOT inline heavy binary payloads in SSE. Tell client to fetch optimized binary.
-                        v_b64 = None
-                        vals_b64 = None
 
                         # determine current sweep azimuth (head) if available
                         try:
@@ -1995,6 +1993,10 @@ def stream_level2_rays():
                 # Rapid-fetch mode: perform short-interval polls up to N attempts
                 rapid_left = int(getattr(monitor, '_rapid_attempts_left', 0) or 0)
                 while rapid_left > 0:
+                    if _should_rotate(started_at):
+                        yield "event: stream-rotate\ndata: {\"reason\":\"pre-timeout-rotate\"}\n\n"
+                        return
+
                     # short wait to allow more bytes to arrive
                     time.sleep(0.18)
                     monitor.fetch_new_bytes()
@@ -2006,24 +2008,12 @@ def stream_level2_rays():
                     if rapid_payload and rapid_payload.get('scans'):
                         # Stream any newly grown scans immediately and refresh rapid counter
                         for scan in rapid_payload['scans']:
-                            class _Level2Adapter2: pass
-                            adapter2 = _Level2Adapter2()
-                            adapter2.level2_arrays = (scan['azimuths'], scan['ranges'], scan['values'])
                             try:
                                 coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
                             except Exception:
                                 coverage_deg = 0.0
 
-                            try:
-                                vertices, values = convert_radar_to_webgl_data(adapter2, site_id, product)
-                            except Exception as e:
-                                print(f"⚠️  Failed rapid convert: {e}")
-                                continue
-
                             formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
-                            # Do not send base64 payload over SSE; let client fetch binary separately
-                            v_b64 = None
-                            vals_b64 = None
 
                             try:
                                 sweep_az2 = float(scan.get('azimuths', [])[-1]) if scan.get('azimuths') else None
