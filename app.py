@@ -1314,164 +1314,225 @@ def get_site_coordinates(site_id):
         site_id = site_id[1:]
     
     sites = {
-        "ABR": {"lat": 45.45583, "lon": -98.41306},
-        "ENX": {"lat": 42.58639, "lon": -74.06389},
-        "ABX": {"lat": 35.14972, "lon": -106.82389},
-        "FDR": {"lat": 34.36222, "lon": -98.97639},
-        "AMA": {"lat": 35.23333, "lon": -101.70917},
-        "AHG": {"lat": 60.72583, "lon": -151.35139},
-        "GUA": {"lat": 13.45250, "lon": 144.80583},
-        "FFC": {"lat": 33.36361, "lon": -84.56583},
-        "EWX": {"lat": 29.70389, "lon": -98.02833},
-        "BBX": {"lat": 39.49611, "lon": -121.63167},
-        "ABC": {"lat": 60.79194, "lon": -161.87639},
-        "BLX": {"lat": 45.85389, "lon": -108.60611},
-        "BGM": {"lat": 42.19972, "lon": -75.98472},
-        "BMX": {"lat": 33.17222, "lon": -86.76972},
-        "BIS": {"lat": 46.77083, "lon": -100.76056},
-        "CBX": {"lat": 43.49056, "lon": -116.23556},
-        "BOX": {"lat": 41.95583, "lon": -71.13694},
-        "BRO": {"lat": 25.91611, "lon": -97.41889},
-        "BUF": {"lat": 42.94889, "lon": -78.73667},
-        "CXX": {"lat": 44.51111, "lon": -73.16694},
-        "RSG": {"lat": 36.95583, "lon": 127.02111},
-        "FDX": {"lat": 34.63528, "lon": -103.62972},
-        "ICX": {"lat": 37.59083, "lon": -112.86222},
-        "CLX": {"lat": 32.65556, "lon": -81.04222},
-        "RLX": {"lat": 38.31111, "lon": -81.72306},
-        "CYS": {"lat": 41.15194, "lon": -104.80611},
-        "LOT": {"lat": 41.60472, "lon": -88.08472},
-        "ILN": {"lat": 39.42028, "lon": -83.82167},
-        "CLE": {"lat": 41.41306, "lon": -81.85972},
-        "CAE": {"lat": 33.94861, "lon": -81.11833},
-        "GWX": {"lat": 33.89667, "lon": -88.32889},
-        "CRP": {"lat": 27.78417, "lon": -97.51111},
-        "FWS": {"lat": 32.57306, "lon": -97.30306},
-        "DVN": {"lat": 41.61167, "lon": -90.58083},
-        "FTG": {"lat": 39.78667, "lon": -104.54583},
-        "DMX": {"lat": 41.73111, "lon": -93.72278},
-        "DTX": {"lat": 42.69972, "lon": -83.47167},
-        "DDC": {"lat": 37.76083, "lon": -99.96889},
-        "DOX": {"lat": 38.82556, "lon": -75.44000},
-        "DLH": {"lat": 46.83694, "lon": -92.20972},
-        "DYX": {"lat": 32.53833, "lon": -99.25444},
-        "EYX": {"lat": 35.09778, "lon": -117.56083},
-        "EVX": {"lat": 30.56444, "lon": -85.92139},
-        "EPZ": {"lat": 31.87306, "lon": -106.69806},
-        "LRX": {"lat": 40.73972, "lon": -116.80278},
-        "BHX": {"lat": 40.49833, "lon": -124.29194},
-        "APD": {"lat": 65.03500, "lon": -147.50167},
-        "FSX": {"lat": 34.57444, "lon": -111.19778},
-        "HPX": {"lat": 36.73667, "lon": -87.28500},
-        "GRK": {"lat": 30.72194, "lon": -97.38306},
-        "POE": {"lat": 31.15556, "lon": -92.97583},
-        "EOX": {"lat": 31.46056, "lon": -85.45944},
-        "SRX": {"lat": 35.29056, "lon": -94.36167},
-        "IWX": {"lat": 41.35889, "lon": -85.70000},
-        "APX": {"lat": 44.90722, "lon": -84.71972},
-        "GGW": {"lat": 48.20639, "lon": -106.62500},
-        "GLD": {"lat": 39.36694, "lon": -101.70028},
-        "MVX": {"lat": 47.52778, "lon": -97.32556},
-        "GJX": {"lat": 39.06222, "lon": -108.21389},
-        "GRR": {"lat": 42.89389, "lon": -85.54472},
-        "TFX": {"lat": 47.45972, "lon": -111.38528},
-        "GRB": {"lat": 44.49833, "lon": -88.11139},
-        "GSP": {"lat": 34.88333, "lon": -82.22000},
-        "RMX": {"lat": 43.46778, "lon": -75.45778},
-        "UEX": {"lat": 40.32083, "lon": -98.44194},
-        "HDX": {"lat": 33.07639, "lon": -106.12278},
-        "CBW": {"lat": 46.03917, "lon": -67.80639},
-        "HGX": {"lat": 29.47194, "lon": -95.07917},
-        "HTX": {"lat": 34.93056, "lon": -86.08333},
-        "IND": {"lat": 39.70750, "lon": -86.28028},
-        "JKL": {"lat": 37.59083, "lon": -83.31306},
-        "DGX": {"lat": 32.31778, "lon": -90.08000},
-        "JAX": {"lat": 30.48472, "lon": -81.70194},
-        "ODN": {"lat": 26.30194, "lon": 127.90972},
-        "HKN": {"lat": 20.12556, "lon": -155.77778},
-        "EAX": {"lat": 38.81028, "lon": -94.26444},
-        "BYX": {"lat": 24.59750, "lon": -81.70306},
-        "AKC": {"lat": 58.67944, "lon": -156.62944},
-        "MRX": {"lat": 36.16861, "lon": -83.40167},
-        "KJK": {"lat": 35.92417, "lon": 126.62222},
-        "ARX": {"lat": 43.82278, "lon": -91.19111},
-        "PLA": {"lat": 38.73028, "lon": -27.32167},
-        "LCH": {"lat": 30.12528, "lon": -93.21583},
-        "ESX": {"lat": 35.70111, "lon": -114.89139},
-        "DFX": {"lat": 29.27278, "lon": -100.28056},
-        "ILX": {"lat": 40.15056, "lon": -89.33722},
-        "LZK": {"lat": 34.83639, "lon": -92.26222},
-        "VTX": {"lat": 34.41167, "lon": -119.17944},
-        "LVX": {"lat": 37.97528, "lon": -85.94389},
-        "LBB": {"lat": 33.65417, "lon": -101.81417},
-        "MQT": {"lat": 46.53111, "lon": -87.54833},
-        "MXX": {"lat": 32.53667, "lon": -85.78972},
-        "MAX": {"lat": 42.08111, "lon": -122.71722},
-        "MLB": {"lat": 28.11333, "lon": -80.65417},
-        "NQA": {"lat": 35.34472, "lon": -89.87333},
-        "AMX": {"lat": 25.61111, "lon": -80.41278},
-        "AIH": {"lat": 59.46139, "lon": -146.30306},
-        "MAF": {"lat": 31.94333, "lon": -102.18917},
-        "MKX": {"lat": 42.96778, "lon": -88.55056},
-        "MPX": {"lat": 44.84889, "lon": -93.56556},
-        "MBX": {"lat": 48.39250, "lon": -100.86500},
-        "MSX": {"lat": 47.04111, "lon": -113.98611},
-        "MOB": {"lat": 30.67944, "lon": -88.23972},
-        "HMO": {"lat": 21.13278, "lon": -157.18000},
-        "VAX": {"lat": 30.39028, "lon": -83.00167},
-        "MHX": {"lat": 34.77611, "lon": -76.87611},
-        "OHX": {"lat": 36.24722, "lon": -86.56250},
-        "LIX": {"lat": 30.33667, "lon": -89.82556},
-        "OKX": {"lat": 40.86556, "lon": -72.86389},
-        "AEC": {"lat": 64.51139, "lon": -165.29500},
-        "AKQ": {"lat": 36.98389, "lon": -77.00722},
-        "LNX": {"lat": 41.95778, "lon": -100.57639},
-        "TLX": {"lat": 35.33306, "lon": -97.27750},
-        "OAX": {"lat": 41.32028, "lon": -96.36667},
-        "PAH": {"lat": 37.06833, "lon": -88.77194},
-        "PDT": {"lat": 45.69056, "lon": -118.85278},
-        "DIX": {"lat": 39.94694, "lon": -74.41083},
-        "IWA": {"lat": 33.28917, "lon": -111.66972},
-        "PBZ": {"lat": 40.53167, "lon": -80.21806},
-        "SFX": {"lat": 43.10583, "lon": -112.68611},
-        "GYX": {"lat": 43.89139, "lon": -70.25639},
-        "RTX": {"lat": 45.71472, "lon": -122.96528},
-        "PUX": {"lat": 38.45944, "lon": -104.18139},
-        "RAX": {"lat": 35.66556, "lon": -78.49000},
-        "UDX": {"lat": 44.12500, "lon": -102.82972},
-        "RGX": {"lat": 39.75417, "lon": -119.46167},
-        "RIW": {"lat": 43.06611, "lon": -108.47722},
-        "FCX": {"lat": 37.02444, "lon": -80.27389},
-        "JGX": {"lat": 32.67528, "lon": -83.35111},
-        "DAX": {"lat": 38.50111, "lon": -121.67750},
-        "LSX": {"lat": 38.69889, "lon": -90.68278},
-        "MTX": {"lat": 41.26278, "lon": -112.44750},
-        "SJT": {"lat": 31.37139, "lon": -100.49250},
-        "NKX": {"lat": 32.91889, "lon": -117.04194},
-        "MUX": {"lat": 37.15528, "lon": -121.89833},
-        "HNX": {"lat": 36.31417, "lon": -119.63194},
-        "JUA": {"lat": 18.11556, "lon": -66.07806},
-        "SOX": {"lat": 33.81778, "lon": -117.63583},
-        "ATX": {"lat": 48.19444, "lon": -122.49583},
-        "SHV": {"lat": 32.45083, "lon": -93.84139},
-        "FSD": {"lat": 43.58778, "lon": -96.72944},
-        "ACG": {"lat": 56.85278, "lon": -135.52917},
-        "HKI": {"lat": 21.89417, "lon": -159.55222},
-        "HWA": {"lat": 19.09500, "lon": -155.56889},
-        "OTX": {"lat": 47.68028, "lon": -117.62667},
-        "SGF": {"lat": 37.23528, "lon": -93.40056},
-        "CCX": {"lat": 40.92306, "lon": -78.00361},
-        "LWX": {"lat": 38.97528, "lon": -77.47778},
-        "TLH": {"lat": 30.39750, "lon": -84.32889},
-        "TBW": {"lat": 27.70556, "lon": -82.40167},
-        "TWX": {"lat": 38.99694, "lon": -96.22583},
-        "EMX": {"lat": 31.89361, "lon": -110.63028},
-        "INX": {"lat": 36.17500, "lon": -95.56472},
-        "VNX": {"lat": 36.74083, "lon": -98.12778},
-        "VBX": {"lat": 34.83806, "lon": -120.39750},
-        "ICT": {"lat": 37.65472, "lon": -97.44278},
-        "LTX": {"lat": 33.98944, "lon": -78.42889},
-        "YUX": {"lat": 32.49528, "lon": -114.65667}
+        # NEXRAD - Continental US (K-prefix stripped)
+        "ABR": {"lat": 45.455833, "lon": -98.413333},
+        "ABX": {"lat": 35.149722, "lon": -106.823889},
+        "AKQ": {"lat": 36.984050, "lon": -77.007361},
+        "AMA": {"lat": 35.233333, "lon": -101.709278},
+        "AMX": {"lat": 25.611083, "lon": -80.412667},
+        "APX": {"lat": 44.906350, "lon": -84.719533},
+        "ARX": {"lat": 43.822778, "lon": -91.191111},
+        "ATX": {"lat": 48.194611, "lon": -122.495694},
+        "BBX": {"lat": 39.495639, "lon": -121.631611},
+        "BGM": {"lat": 42.199694, "lon": -75.984722},
+        "BHX": {"lat": 40.498583, "lon": -124.292167},
+        "BIS": {"lat": 46.770833, "lon": -100.760556},
+        "BLX": {"lat": 45.853778, "lon": -108.606806},
+        "BMX": {"lat": 33.172417, "lon": -86.770167},
+        "BOX": {"lat": 41.955778, "lon": -71.136861},
+        "BRO": {"lat": 25.916000, "lon": -97.418967},
+        "BUF": {"lat": 42.948789, "lon": -78.736781},
+        "BYX": {"lat": 24.597500, "lon": -81.703167},
+        "CAE": {"lat": 33.948722, "lon": -81.118278},
+        "CBW": {"lat": 46.039250, "lon": -67.806431},
+        "CBX": {"lat": 43.490217, "lon": -116.236028},
+        "CCX": {"lat": 40.923167, "lon": -78.003722},
+        "CLE": {"lat": 41.413217, "lon": -81.859867},
+        "CLX": {"lat": 32.655528, "lon": -81.042194},
+        "CRI": {"lat": 35.238333, "lon": -97.460000},
+        "CRP": {"lat": 27.784017, "lon": -97.511250},
+        "CXX": {"lat": 44.511000, "lon": -73.166431},
+        "CYS": {"lat": 41.151919, "lon": -104.806028},
+        "DAX": {"lat": 38.501111, "lon": -121.677833},
+        "DDC": {"lat": 37.760833, "lon": -99.968889},
+        "DFX": {"lat": 29.273139, "lon": -100.280333},
+        "DGX": {"lat": 32.279944, "lon": -89.984444},
+        "DIX": {"lat": 39.947089, "lon": -74.410731},
+        "DLH": {"lat": 46.836944, "lon": -92.209722},
+        "DMX": {"lat": 41.731200, "lon": -93.722869},
+        "DOX": {"lat": 38.825767, "lon": -75.440117},
+        "DTX": {"lat": 42.700000, "lon": -83.471667},
+        "DVN": {"lat": 41.611667, "lon": -90.580833},
+        "DYX": {"lat": 32.538500, "lon": -99.254333},
+        "EAX": {"lat": 38.810250, "lon": -94.264472},
+        "EMX": {"lat": 31.893650, "lon": -110.630250},
+        "ENX": {"lat": 42.586556, "lon": -74.064083},
+        "EOX": {"lat": 31.460556, "lon": -85.459389},
+        "EPZ": {"lat": 31.873056, "lon": -106.698000},
+        "ESX": {"lat": 35.701350, "lon": -114.891647},
+        "EVX": {"lat": 30.565033, "lon": -85.921667},
+        "EWX": {"lat": 29.704056, "lon": -98.028611},
+        "EYX": {"lat": 35.097850, "lon": -117.560750},
+        "FCX": {"lat": 37.024400, "lon": -80.273969},
+        "FDR": {"lat": 34.362194, "lon": -98.976667},
+        "FDX": {"lat": 34.634167, "lon": -103.618889},
+        "FFC": {"lat": 33.363550, "lon": -84.565944},
+        "FSD": {"lat": 43.587778, "lon": -96.729444},
+        "FSX": {"lat": 34.574333, "lon": -111.198444},
+        "FTG": {"lat": 39.786639, "lon": -104.545806},
+        "FWS": {"lat": 32.573000, "lon": -97.303150},
+        "GGW": {"lat": 48.206361, "lon": -106.624694},
+        "GJX": {"lat": 39.062169, "lon": -108.213764},
+        "GLD": {"lat": 39.366944, "lon": -101.700278},
+        "GRB": {"lat": 44.498633, "lon": -88.111111},
+        "GRK": {"lat": 30.721833, "lon": -97.382944},
+        "GRR": {"lat": 42.893889, "lon": -85.544889},
+        "GSP": {"lat": 34.883306, "lon": -82.219833},
+        "GWX": {"lat": 33.896917, "lon": -88.329194},
+        "GYX": {"lat": 43.891306, "lon": -70.256361},
+        "HDC": {"lat": 30.519300, "lon": -90.407400},
+        "HDX": {"lat": 33.077000, "lon": -106.120028},
+        "HGX": {"lat": 29.471900, "lon": -95.078733},
+        "HNX": {"lat": 36.314181, "lon": -119.632128},
+        "HPX": {"lat": 36.736972, "lon": -87.285583},
+        "HTX": {"lat": 34.930556, "lon": -86.083611},
+        "ICT": {"lat": 37.654444, "lon": -97.443056},
+        "ICX": {"lat": 37.591050, "lon": -112.862181},
+        "ILN": {"lat": 39.420483, "lon": -83.821450},
+        "ILX": {"lat": 40.150500, "lon": -89.336792},
+        "IND": {"lat": 39.707500, "lon": -86.280278},
+        "INX": {"lat": 36.175131, "lon": -95.564161},
+        "IWA": {"lat": 33.289233, "lon": -111.669908},
+        "IWX": {"lat": 41.358611, "lon": -85.700000},
+        "JAX": {"lat": 30.484633, "lon": -81.701900},
+        "JGX": {"lat": 32.675683, "lon": -83.350833},
+        "JKL": {"lat": 37.590833, "lon": -83.313056},
+        "LBB": {"lat": 33.654139, "lon": -101.814167},
+        "LCH": {"lat": 30.125306, "lon": -93.215889},
+        "LGX": {"lat": 47.116944, "lon": -124.106667},
+        "LIX": {"lat": 30.336667, "lon": -89.825417},
+        "LNX": {"lat": 41.957944, "lon": -100.576222},
+        "LOT": {"lat": 41.604444, "lon": -88.084444},
+        "LRX": {"lat": 40.739550, "lon": -116.802700},
+        "LSX": {"lat": 38.698611, "lon": -90.682778},
+        "LTX": {"lat": 33.989150, "lon": -78.429108},
+        "LVX": {"lat": 37.975278, "lon": -85.943889},
+        "LWX": {"lat": 38.976111, "lon": -77.487500},
+        "LZK": {"lat": 34.836500, "lon": -92.262194},
+        "MAF": {"lat": 31.943461, "lon": -102.189250},
+        "MAX": {"lat": 42.081169, "lon": -122.717361},
+        "MBX": {"lat": 48.393056, "lon": -100.864444},
+        "MHX": {"lat": 34.775908, "lon": -76.876189},
+        "MKX": {"lat": 42.967800, "lon": -88.550667},
+        "MLB": {"lat": 28.113194, "lon": -80.654083},
+        "MOB": {"lat": 30.679444, "lon": -88.240000},
+        "MPX": {"lat": 44.848889, "lon": -93.565528},
+        "MQT": {"lat": 46.531111, "lon": -87.548333},
+        "MRX": {"lat": 36.168611, "lon": -83.401944},
+        "MSX": {"lat": 47.041000, "lon": -113.986222},
+        "MTX": {"lat": 41.262778, "lon": -112.447778},
+        "MUX": {"lat": 37.155222, "lon": -121.898444},
+        "MVX": {"lat": 47.527778, "lon": -97.325556},
+        "MXX": {"lat": 32.536650, "lon": -85.789750},
+        "NKX": {"lat": 32.919017, "lon": -117.041800},
+        "NQA": {"lat": 35.344722, "lon": -89.873333},
+        "OAX": {"lat": 41.320369, "lon": -96.366819},
+        "OHX": {"lat": 36.247222, "lon": -86.562500},
+        "OKX": {"lat": 40.865528, "lon": -72.863917},
+        "OTX": {"lat": 47.680417, "lon": -117.626775},
+        "OUN": {"lat": 35.236058, "lon": -97.462350},
+        "PAH": {"lat": 37.068333, "lon": -88.771944},
+        "PBZ": {"lat": 40.531717, "lon": -80.217967},
+        "PDT": {"lat": 45.690650, "lon": -118.852931},
+        "POE": {"lat": 31.155278, "lon": -92.976111},
+        "PUX": {"lat": 38.459550, "lon": -104.181350},
+        "RAX": {"lat": 35.665519, "lon": -78.489750},
+        "RGX": {"lat": 39.754056, "lon": -119.462022},
+        "RIW": {"lat": 43.066089, "lon": -108.477300},
+        "RLX": {"lat": 38.311111, "lon": -81.722778},
+        "RTX": {"lat": 45.715039, "lon": -122.965000},
+        "SFX": {"lat": 43.105600, "lon": -112.686131},
+        "SGF": {"lat": 37.235239, "lon": -93.400419},
+        "SHV": {"lat": 32.450833, "lon": -93.841250},
+        "SJT": {"lat": 31.371278, "lon": -100.492500},
+        "SOX": {"lat": 33.817733, "lon": -117.636000},
+        "SRX": {"lat": 35.290417, "lon": -94.361889},
+        "TBW": {"lat": 27.705500, "lon": -82.401778},
+        "TFX": {"lat": 47.459583, "lon": -111.385333},
+        "TLH": {"lat": 30.397583, "lon": -84.328944},
+        "TLX": {"lat": 35.333361, "lon": -97.277761},
+        "TWX": {"lat": 38.996950, "lon": -96.232550},
+        "TYX": {"lat": 43.755694, "lon": -75.679861},
+        "UDX": {"lat": 44.124722, "lon": -102.830000},
+        "UEX": {"lat": 40.320833, "lon": -98.441944},
+        "VAX": {"lat": 30.890278, "lon": -83.001806},
+        "VBX": {"lat": 34.838550, "lon": -120.397917},
+        "VNX": {"lat": 36.740617, "lon": -98.127717},
+        "VTX": {"lat": 34.412017, "lon": -119.178750},
+        "VWX": {"lat": 38.260250, "lon": -87.724528},
+        "YUX": {"lat": 32.495281, "lon": -114.656708},
+        # NEXRAD - Alaska
+        "PABC": {"lat": 60.791944, "lon": -161.876389},
+        "PACG": {"lat": 56.852778, "lon": -135.529167},
+        "PAEC": {"lat": 64.511389, "lon": -165.295000},
+        "PAHG": {"lat": 60.725914, "lon": -151.351464},
+        "PAIH": {"lat": 59.460767, "lon": -146.303444},
+        "PAKC": {"lat": 58.679444, "lon": -156.629444},
+        "PAPD": {"lat": 65.035114, "lon": -147.501431},
+        # NEXRAD - Hawaii
+        "PHKI": {"lat": 21.893889, "lon": -159.552500},
+        "PHKM": {"lat": 20.125278, "lon": -155.777778},
+        "PHMO": {"lat": 21.132778, "lon": -157.180278},
+        "PHWA": {"lat": 19.095000, "lon": -155.568889},
+        # NEXRAD - Guam
+        "PGUA": {"lat": 13.455833, "lon": 144.811111},
+        # NEXRAD - Korea
+        "RKJK": {"lat": 35.924167, "lon": 126.622222},
+        "RKSG": {"lat": 37.207569, "lon": 127.285561},
+        # NEXRAD - Japan
+        "RODN": {"lat": 26.307800, "lon": 127.903469},
+        # NEXRAD - Azores
+        "LPLA": {"lat": 38.730280, "lon": -27.321670},
+        # NEXRAD - Puerto Rico
+        "TJUA": {"lat": 18.115667, "lon": -66.078167},
+        # TDWR sites
+        "TADW": {"lat": 38.695000, "lon": -76.845000},
+        "TATL": {"lat": 33.646944, "lon": -84.261944},
+        "TBNA": {"lat": 35.980000, "lon": -86.661944},
+        "TBOS": {"lat": 42.158056, "lon": -70.933056},
+        "TBWI": {"lat": 39.090000, "lon": -76.630000},
+        "TCLT": {"lat": 35.336944, "lon": -80.885000},
+        "TCMH": {"lat": 40.006111, "lon": -82.715000},
+        "TCVG": {"lat": 38.898056, "lon": -84.580000},
+        "TDAL": {"lat": 32.926111, "lon": -96.968056},
+        "TDAY": {"lat": 40.021944, "lon": -84.123056},
+        "TDCA": {"lat": 38.758889, "lon": -76.961944},
+        "TDEN": {"lat": 39.728056, "lon": -104.526111},
+        "TDFW": {"lat": 33.065000, "lon": -96.918056},
+        "TDTW": {"lat": 42.111111, "lon": -83.515000},
+        "TEWR": {"lat": 40.593056, "lon": -74.270000},
+        "TFLL": {"lat": 26.143056, "lon": -80.343889},
+        "THOU": {"lat": 29.516111, "lon": -95.241944},
+        "TIAD": {"lat": 39.083889, "lon": -77.528889},
+        "TIAH": {"lat": 30.065000, "lon": -95.566944},
+        "TICH": {"lat": 37.506944, "lon": -97.436944},
+        "TIDS": {"lat": 39.636944, "lon": -86.436111},
+        "TJBQ": {"lat": 18.485000, "lon": -67.143000},
+        "TJFK": {"lat": 40.588889, "lon": -73.881111},
+        "TJRV": {"lat": 18.256000, "lon": -65.637000},
+        "TLAS": {"lat": 36.143889, "lon": -115.006944},
+        "TLVE": {"lat": 41.290000, "lon": -82.008056},
+        "TMCI": {"lat": 39.498056, "lon": -94.741944},
+        "TMCO": {"lat": 28.343889, "lon": -81.326111},
+        "TMDW": {"lat": 41.651111, "lon": -87.730000},
+        "TMEM": {"lat": 34.896111, "lon": -89.993056},
+        "TMIA": {"lat": 25.758056, "lon": -80.491111},
+        "TMKE": {"lat": 42.818889, "lon": -88.046111},
+        "TMSP": {"lat": 44.871111, "lon": -92.933056},
+        "TMSY": {"lat": 30.021944, "lon": -90.403056},
+        "TOKC": {"lat": 35.276111, "lon": -97.510000},
+        "TORD": {"lat": 41.796944, "lon": -87.858056},
+        "TPBI": {"lat": 26.688056, "lon": -80.273056},
+        "TPHL": {"lat": 39.948889, "lon": -75.068889},
+        "TPHX": {"lat": 33.421111, "lon": -112.163056},
+        "TPIT": {"lat": 40.501111, "lon": -80.486111},
+        "TRDU": {"lat": 36.001944, "lon": -78.696944},
+        "TSDF": {"lat": 38.046111, "lon": -85.610000},
+        "TSJU": {"lat": 18.473889, "lon": -66.178889},
+        "TSLC": {"lat": 40.966944, "lon": -111.930000},
+        "TSTL": {"lat": 38.805000, "lon": -90.488889},
+        "TTPA": {"lat": 27.860000, "lon": -82.518056},
+        "TTUL": {"lat": 36.071111, "lon": -95.826944},
     }
     
     return sites.get(site_id, {"lat": 39.8333333, "lon": -98.585522})
@@ -1894,10 +1955,22 @@ def stream_level2_rays():
     elevation = float(request.args.get('elevation', '0.5'))
     # Default to 0.5s polling for lower-latency updates (can be overriden with ?interval=...)
     check_interval = max(0.5, float(request.args.get('interval', 3)))
+    # Rotate long-lived SSE responses before sync-worker timeout kills the worker.
+    # EventSource clients will reconnect automatically.
+    stream_max_seconds = float(os.getenv('SSE_STREAM_MAX_SECONDS', '45'))
+    stream_max_seconds = max(10.0, min(300.0, stream_max_seconds))
+
+    def _should_rotate(started_at):
+        return (time.monotonic() - started_at) >= stream_max_seconds
 
     def generate():
+        started_at = time.monotonic()
         try:
             while True:
+                if _should_rotate(started_at):
+                    yield "event: stream-rotate\ndata: {\"reason\":\"pre-timeout-rotate\"}\n\n"
+                    return
+
                 # 1. ALWAYS check for the latest filename inside the loop
                 try:
                     files = _fetch_level2_dirlist(site_id)
@@ -1935,27 +2008,13 @@ def stream_level2_rays():
                     # scan appears partial (coverage < 360°), enter a short rapid-fetch
                     # mode to pull the remaining rays quickly.
                     for scan in new_payload['scans']:
-                        class _Level2Adapter: pass
-                        adapter = _Level2Adapter()
-                        adapter.level2_arrays = (scan['azimuths'], scan['ranges'], scan['values'])
-
                         # Compute azimuth coverage (client uses this to animate sweep)
                         try:
                             coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
                         except Exception:
                             coverage_deg = 0.0
 
-                        try:
-                            vertices, values = convert_radar_to_webgl_data(adapter, site_id, product)
-                        except Exception as e:
-                            print(f"⚠️  Failed to convert scan to WebGL: {e}")
-                            continue
-
                         formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
-
-                        # Do NOT inline heavy binary payloads in SSE. Tell client to fetch optimized binary.
-                        v_b64 = None
-                        vals_b64 = None
 
                         # determine current sweep azimuth (head) if available
                         try:
@@ -1995,6 +2054,10 @@ def stream_level2_rays():
                 # Rapid-fetch mode: perform short-interval polls up to N attempts
                 rapid_left = int(getattr(monitor, '_rapid_attempts_left', 0) or 0)
                 while rapid_left > 0:
+                    if _should_rotate(started_at):
+                        yield "event: stream-rotate\ndata: {\"reason\":\"pre-timeout-rotate\"}\n\n"
+                        return
+
                     # short wait to allow more bytes to arrive
                     time.sleep(0.18)
                     monitor.fetch_new_bytes()
@@ -2006,24 +2069,12 @@ def stream_level2_rays():
                     if rapid_payload and rapid_payload.get('scans'):
                         # Stream any newly grown scans immediately and refresh rapid counter
                         for scan in rapid_payload['scans']:
-                            class _Level2Adapter2: pass
-                            adapter2 = _Level2Adapter2()
-                            adapter2.level2_arrays = (scan['azimuths'], scan['ranges'], scan['values'])
                             try:
                                 coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
                             except Exception:
                                 coverage_deg = 0.0
 
-                            try:
-                                vertices, values = convert_radar_to_webgl_data(adapter2, site_id, product)
-                            except Exception as e:
-                                print(f"⚠️  Failed rapid convert: {e}")
-                                continue
-
                             formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
-                            # Do not send base64 payload over SSE; let client fetch binary separately
-                            v_b64 = None
-                            vals_b64 = None
 
                             try:
                                 sweep_az2 = float(scan.get('azimuths', [])[-1]) if scan.get('azimuths') else None
