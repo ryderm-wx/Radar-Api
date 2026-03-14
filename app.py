@@ -1537,69 +1537,59 @@ def get_site_coordinates(site_id):
     
     return sites.get(site_id, {"lat": 39.8333333, "lon": -98.585522})
 
+EARTH_RADIUS_KM = 6371.0088
+
+
+def _polar_to_latlon_geodesic_vec(azimuths_deg, ranges_km, origin):
+    """
+    Vectorized great-circle destination from radar origin.
+    Inputs are arrays of azimuth (deg clockwise from north) and distance (km).
+    Returns tuple (lon_deg, lat_deg) as float32 arrays.
+    """
+    lat0 = np.radians(np.float64(origin['lat']))
+    lon0 = np.radians(np.float64(origin['lon']))
+
+    az = np.radians(np.asarray(azimuths_deg, dtype=np.float64))
+    delta = np.asarray(ranges_km, dtype=np.float64) / EARTH_RADIUS_KM
+
+    sin_lat0 = np.sin(lat0)
+    cos_lat0 = np.cos(lat0)
+    sin_delta = np.sin(delta)
+    cos_delta = np.cos(delta)
+
+    sin_lat2 = sin_lat0 * cos_delta + cos_lat0 * sin_delta * np.cos(az)
+    lat2 = np.arcsin(np.clip(sin_lat2, -1.0, 1.0))
+
+    y = np.sin(az) * sin_delta * cos_lat0
+    x = cos_delta - sin_lat0 * sin_lat2
+    lon2 = lon0 + np.arctan2(y, x)
+
+    lat_deg = np.degrees(lat2)
+    lon_deg = (np.degrees(lon2) + 540.0) % 360.0 - 180.0
+
+    return lon_deg.astype(np.float32), lat_deg.astype(np.float32)
+
+
 def fast_polar_to_latlon_vec(azimuths, ranges, origin):
     """
-    Fast vectorized polar to lat/lon approx using flat earth math.
+    Fast vectorized polar to lat/lon conversion using geodesic math.
     Inputs are 1D numpy arrays.
     Returns Nx2 array of [lon, lat].
     """
-    lat0, lon0 = origin['lat'], origin['lon']
-
-    # Pre-compute sin/cos once
-    az_rad = np.radians(azimuths)
-    sin_az = np.sin(az_rad)
-    cos_az = np.cos(az_rad)
-    
-    x = ranges * sin_az    # km east
-    y = ranges * cos_az    # km north
-
-    # Degree per km approx at ~40°N latitude
-    lat = lat0 + y * 0.008983
-    lon = lon0 + x * 0.011427
-
-    # Use column_stack instead of vstack + transpose (faster)
+    lon, lat = _polar_to_latlon_geodesic_vec(azimuths, ranges, origin)
     return np.column_stack([lon, lat])
 
 def calculate_vertices_batch(az_start_arr, az_end_arr, r1_arr, r2_arr, origin):
     """
-    Vectorized polygon vertices calc with flat-earth approx for speed.
+    Vectorized polygon vertices calc using geodesic destination math.
     Returns array shape (N, 4, 2) of lon/lat corners.
     """
     N = len(az_start_arr)
-    lat0, lon0 = origin['lat'], origin['lon']
-    
-    # Pre-compute trig for all azimuths
-    az_start_rad = np.radians(az_start_arr)
-    az_end_rad = np.radians(az_end_arr)
-    sin_start = np.sin(az_start_rad)
-    cos_start = np.cos(az_start_rad)
-    sin_end = np.sin(az_end_rad)
-    cos_end = np.cos(az_end_rad)
-    
-    # Calculate all 4 corners using broadcasting
-    # Corner 1: (az_start, r1)
-    x1 = r1_arr * sin_start
-    y1 = r1_arr * cos_start
-    lat1 = lat0 + y1 * 0.008983
-    lon1 = lon0 + x1 * 0.011427
-    
-    # Corner 2: (az_start, r2)
-    x2 = r2_arr * sin_start
-    y2 = r2_arr * cos_start
-    lat2 = lat0 + y2 * 0.008983
-    lon2 = lon0 + x2 * 0.011427
-    
-    # Corner 3: (az_end, r2)
-    x3 = r2_arr * sin_end
-    y3 = r2_arr * cos_end
-    lat3 = lat0 + y3 * 0.008983
-    lon3 = lon0 + x3 * 0.011427
-    
-    # Corner 4: (az_end, r1)
-    x4 = r1_arr * sin_end
-    y4 = r1_arr * cos_end
-    lat4 = lat0 + y4 * 0.008983
-    lon4 = lon0 + x4 * 0.011427
+
+    lon1, lat1 = _polar_to_latlon_geodesic_vec(az_start_arr, r1_arr, origin)
+    lon2, lat2 = _polar_to_latlon_geodesic_vec(az_start_arr, r2_arr, origin)
+    lon3, lat3 = _polar_to_latlon_geodesic_vec(az_end_arr, r2_arr, origin)
+    lon4, lat4 = _polar_to_latlon_geodesic_vec(az_end_arr, r1_arr, origin)
     
     # Stack directly into (N, 4, 2) without intermediate flatten/reshape
     coords = np.empty((N, 4, 2), dtype=np.float32)
