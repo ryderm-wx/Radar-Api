@@ -45,6 +45,7 @@ LEVEL2_FILENAME_PATTERN = re.compile(r"^[A-Z]{4}_(\d{8})_(\d{6})\.bz2$")
 REQUEST_TIMEOUT = (2.5, 20)
 RADAR_KEY_CACHE_TTL = 10  # seconds before reusing cached key without hitting S3
 RADAR_KEY_CACHE_MAX_AGE = 180  # hard cap before forcing a full refresh
+RADAR_KEY_LOOKBACK_DAYS = 2  # when date isn't provided, scan today + recent days
 LEVEL2_DIRLIST_CACHE_TTL = 8  # seconds
 STREAM_CHUNK_SIZE = 64 * 1024
 HRRR_BASE_URL = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/hrrr/prod"
@@ -112,6 +113,8 @@ level2_download_locks_lock = Lock()
 processed_data_cache = OrderedDict()
 processed_data_lock = Lock()
 PROCESSED_CACHE_MAX_SIZE = 5  # Keep last 5 processed radar scans (Railway friendly)
+TEMP_CLEANUP_INTERVAL_SEC = 60
+last_temp_cleanup_ts = 0.0
 
 LEVEL2_SWEEP_REQUIRED_COVERAGE_DEG = 359.0  # require near-complete 360° sweep
 
@@ -537,11 +540,14 @@ def get_latest_radar_key(site_id, product, date=None):
     site_id = site_id.upper()
     product = product.upper()
 
-    if date is None:
-        date = datetime.now(timezone.utc).strftime("%Y_%m_%d")
+    if date is not None:
+        prefix = f"{site_id}_{product}_{date}"
+        cache_key = (prefix,)
+    else:
+        # Keep a stable "latest" cache key across UTC date rollovers.
+        prefix = None
+        cache_key = (site_id, product, "latest")
 
-    prefix = f"{site_id}_{product}_{date}"
-    cache_key = (prefix,)
     now = time.monotonic()
 
     with latest_key_lock:
@@ -554,22 +560,50 @@ def get_latest_radar_key(site_id, product, date=None):
     latest_key = None
 
     if last_known_key:
+        last_known_ts = _parse_timestamp_from_key(last_known_key)
+        if last_known_ts is not None:
+            last_date = last_known_ts.strftime("%Y_%m_%d")
+            incremental_prefix = f"{site_id}_{product}_{last_date}"
+        elif date is not None:
+            incremental_prefix = f"{site_id}_{product}_{date}"
+        else:
+            incremental_prefix = None
+
         try:
-            incremental = _list_radar_keys(prefix, max_keys=50, start_after=last_known_key)
+            incremental = _list_radar_keys(incremental_prefix, max_keys=200, start_after=last_known_key) if incremental_prefix else []
         except Exception:
-            incremental = []
+            # If incremental listing fails, force a full refresh below.
+            incremental = None
 
         if incremental:
             latest_key = incremental[-1]
-        elif (now - last_checked) < RADAR_KEY_CACHE_MAX_AGE:
+        elif incremental == [] and (now - last_checked) < RADAR_KEY_CACHE_MAX_AGE:
             _cache_latest_key(cache_key, last_known_key)
             return last_known_key
 
     if latest_key is None:
-        keys = _list_radar_keys(prefix)
-        if not keys:
-            raise FileNotFoundError(f"No radar files found for prefix {prefix}")
-        latest_key = keys[-1]
+        if date is not None:
+            keys = _list_radar_keys(f"{site_id}_{product}_{date}")
+            if not keys:
+                raise FileNotFoundError(f"No radar files found for prefix {site_id}_{product}_{date}")
+            latest_key = keys[-1]
+        else:
+            now_utc = datetime.now(timezone.utc)
+            candidates = []
+            for day_offset in range(0, RADAR_KEY_LOOKBACK_DAYS + 1):
+                day = (now_utc - timedelta(days=day_offset)).strftime("%Y_%m_%d")
+                day_prefix = f"{site_id}_{product}_{day}"
+                keys = _list_radar_keys(day_prefix)
+                if keys:
+                    candidates.append(keys[-1])
+
+            if not candidates:
+                raise FileNotFoundError(f"No radar files found for {site_id} {product} in recent dates")
+
+            latest_key = max(
+                candidates,
+                key=lambda k: _parse_timestamp_from_key(k) or datetime.min.replace(tzinfo=timezone.utc)
+            )
 
     _cache_latest_key(cache_key, latest_key)
     return latest_key
@@ -699,8 +733,21 @@ def download_radar_file_by_key(key, *, use_cache=True):
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
     if use_cache and temp_path.exists() and temp_path.stat().st_size > 0:
-        print(f"♻️  Reusing cached radar file {key}")
-        return str(temp_path)
+        local_size = temp_path.stat().st_size
+        try:
+            head_resp = http_session.head(file_url, timeout=2.0, allow_redirects=True)
+            remote_size = int(head_resp.headers.get('Content-Length', 0))
+            head_resp.close()
+
+            if remote_size > 0 and local_size == remote_size:
+                print(f"♻️  Reusing cached radar file {key} (size match)")
+                return str(temp_path)
+
+            print(f"🔄 Radar cache mismatch for {key}: local={local_size}, remote={remote_size}. Redownloading.")
+        except Exception as e:
+            # Prefer serving cached copy over failing requests if metadata check fails.
+            print(f"⚠️  Radar cache HEAD check failed ({e}); using cached file for {key}")
+            return str(temp_path)
 
     print(f"✅ Fetching radar file: {file_url}")
 
@@ -1485,7 +1532,7 @@ def get_site_coordinates(site_id):
         "LPLA": {"lat": 38.730280, "lon": -27.321670},
         # NEXRAD - Puerto Rico
         "TJUA": {"lat": 18.115667, "lon": -66.078167},
-        # TDWR sites
+        # TDWR sites  #I want you to completely revise how our nexrad data loops. Right now, it is using a really slow approach. Instead of doing each file one by one, use a multithreading approach to get it done almost instantly, and make the play button on the bottom center quick access bar instead of in the menu. No extra settings, just a play button that turns into a pause button that goes back to the latest radar frame then resumes fetching.
         "TADW": {"lat": 38.695000, "lon": -76.845000},
         "TATL": {"lat": 33.646944, "lon": -84.261944},
         "TBNA": {"lat": 35.980000, "lon": -86.661944},
@@ -1581,27 +1628,57 @@ def fast_polar_to_latlon_vec(azimuths, ranges, origin):
 
 def calculate_vertices_batch(az_start_arr, az_end_arr, r1_arr, r2_arr, origin):
     """
-    Vectorized polygon vertices calc using geodesic destination math.
+    Fast vectorized polygon vertices calc using geodesic destination math.
+    Reuses trig terms across corners to reduce total compute.
     Returns array shape (N, 4, 2) of lon/lat corners.
     """
     N = len(az_start_arr)
+    if N == 0:
+        return np.empty((0, 4, 2), dtype=np.float32)
 
-    lon1, lat1 = _polar_to_latlon_geodesic_vec(az_start_arr, r1_arr, origin)
-    lon2, lat2 = _polar_to_latlon_geodesic_vec(az_start_arr, r2_arr, origin)
-    lon3, lat3 = _polar_to_latlon_geodesic_vec(az_end_arr, r2_arr, origin)
-    lon4, lat4 = _polar_to_latlon_geodesic_vec(az_end_arr, r1_arr, origin)
-    
-    # Stack directly into (N, 4, 2) without intermediate flatten/reshape
+    # Normalize input dtypes once to avoid repeated conversions.
+    az_start_arr = np.asarray(az_start_arr, dtype=np.float32)
+    az_end_arr = np.asarray(az_end_arr, dtype=np.float32)
+    r1_arr = np.asarray(r1_arr, dtype=np.float32)
+    r2_arr = np.asarray(r2_arr, dtype=np.float32)
+
+    lat0 = np.radians(np.float32(origin['lat']))
+    lon0 = np.radians(np.float32(origin['lon']))
+    sin_lat0 = np.sin(lat0)
+    cos_lat0 = np.cos(lat0)
+
+    # Precompute azimuth trig terms once each.
+    az_start_rad = np.radians(az_start_arr)
+    az_end_rad = np.radians(az_end_arr)
+    sin_az_start = np.sin(az_start_rad)
+    cos_az_start = np.cos(az_start_rad)
+    sin_az_end = np.sin(az_end_rad)
+    cos_az_end = np.cos(az_end_rad)
+
+    # Precompute distance trig terms once each.
+    d1 = r1_arr / np.float32(EARTH_RADIUS_KM)
+    d2 = r2_arr / np.float32(EARTH_RADIUS_KM)
+    sin_d1 = np.sin(d1)
+    cos_d1 = np.cos(d1)
+    sin_d2 = np.sin(d2)
+    cos_d2 = np.cos(d2)
+
+    # Corner ordering: (az_start,r1), (az_start,r2), (az_end,r2), (az_end,r1)
+    sin_az = np.stack([sin_az_start, sin_az_start, sin_az_end, sin_az_end], axis=1)
+    cos_az = np.stack([cos_az_start, cos_az_start, cos_az_end, cos_az_end], axis=1)
+    sin_d = np.stack([sin_d1, sin_d2, sin_d2, sin_d1], axis=1)
+    cos_d = np.stack([cos_d1, cos_d2, cos_d2, cos_d1], axis=1)
+
+    sin_lat2 = sin_lat0 * cos_d + cos_lat0 * sin_d * cos_az
+    lat2 = np.arcsin(np.clip(sin_lat2, -1.0, 1.0))
+
+    y = sin_az * sin_d * cos_lat0
+    x = cos_d - sin_lat0 * sin_lat2
+    lon2 = lon0 + np.arctan2(y, x)
+
     coords = np.empty((N, 4, 2), dtype=np.float32)
-    coords[:, 0, 0] = lon1
-    coords[:, 0, 1] = lat1
-    coords[:, 1, 0] = lon2
-    coords[:, 1, 1] = lat2
-    coords[:, 2, 0] = lon3
-    coords[:, 2, 1] = lat3
-    coords[:, 3, 0] = lon4
-    coords[:, 3, 1] = lat4
-    
+    coords[:, :, 0] = (np.degrees(lon2) + 540.0) % 360.0 - 180.0
+    coords[:, :, 1] = np.degrees(lat2)
     return coords
 
 @app.route('/api/radar/<site_id>', methods=['GET'])
@@ -1712,63 +1789,43 @@ def convert_radar_to_webgl_data(radar_data, site_id, product='N0B'):
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
     print(f"  ⏱️  extract_radar_data: {(time.time() - t_extract)*1000:.1f}ms")
 
-    azimuths = np.array(azimuths)
-    ranges = np.array(ranges)
-    radar_values = np.array(radar_values)
+    azimuths = np.asarray(azimuths, dtype=np.float32)
+    ranges = np.asarray(ranges, dtype=np.float32)
+    radar_values = np.asarray(radar_values, dtype=np.float32)
 
     az_start = azimuths
     az_end = np.roll(azimuths, -1)
     az_diff = (az_end - az_start) % 360
     valid_az = az_diff < 10
     if not np.any(valid_az):
-        return [], []
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
 
     r1 = ranges[:-1]
     r2 = ranges[1:]
-    valid_az_indices = np.where(valid_az)[0]
 
-    # OPTIMIZED: Pre-allocate arrays and use vectorized operations
+    # Fully vectorized valid-bin extraction (avoids Python loop/list overhead).
     is_velocity_product = product in ['N0G', 'N0S', 'N1G', 'N1S', 'N2G', 'N2S', 'N3G', 'N3S']
-    value_threshold = -999 if is_velocity_product else 0
-    
-    # Collect all valid data first
-    all_az_starts = []
-    all_az_ends = []
-    all_r1s = []
-    all_r2s = []
-    all_vals = []
-    
-    for idx in valid_az_indices:
-        az_s = az_start[idx]
-        az_e = az_end[idx]
-        vals = radar_values[idx, :-1]
-        
-        if is_velocity_product:
-            valid_mask = ~np.isnan(vals) & (vals != -999)
-        else:
-            valid_mask = (vals > value_threshold) & ~np.isnan(vals)
-            
-        if not np.any(valid_mask):
-            continue
-        
-        valid_rng_indices = np.where(valid_mask)[0]
-        n_valid = len(valid_rng_indices)
-        
-        all_az_starts.extend([az_s] * n_valid)
-        all_az_ends.extend([az_e] * n_valid)
-        all_r1s.extend(r1[valid_rng_indices])
-        all_r2s.extend(r2[valid_rng_indices])
-        all_vals.extend(vals[valid_rng_indices])
-    
-    if not all_az_starts:
+    vals_grid = radar_values[valid_az, :-1]
+    if vals_grid.size == 0:
         return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
-    
-    # Convert to numpy arrays for batch processing
-    all_az_starts = np.array(all_az_starts)
-    all_az_ends = np.array(all_az_ends)
-    all_r1s = np.array(all_r1s)
-    all_r2s = np.array(all_r2s)
-    all_vals = np.array(all_vals, dtype=np.float32)
+
+    if is_velocity_product:
+        valid_mask = ~np.isnan(vals_grid) & (vals_grid != -999.0)
+    else:
+        valid_mask = ~np.isnan(vals_grid) & (vals_grid > 0.0)
+
+    row_idx, col_idx = np.nonzero(valid_mask)
+    if row_idx.size == 0:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+
+    valid_az_start = az_start[valid_az]
+    valid_az_end = az_end[valid_az]
+
+    all_az_starts = valid_az_start[row_idx]
+    all_az_ends = valid_az_end[row_idx]
+    all_r1s = r1[col_idx]
+    all_r2s = r2[col_idx]
+    all_vals = vals_grid[row_idx, col_idx].astype(np.float32, copy=False)
     
     # Calculate all vertices at once
     t_vertices = time.time()
@@ -1779,9 +1836,8 @@ def convert_radar_to_webgl_data(radar_data, site_id, product='N0B'):
     t_triangles = time.time()
     n_quads = len(verts_batch)
     
-    # Convert verts_batch list to numpy array for vectorized operations
-    # verts_batch is shape (n_quads, 4, 2) - 4 vertices, each with (lon, lat)
-    verts_array = np.array(verts_batch, dtype=np.float32)  # Shape: (n_quads, 4, 2)
+    # verts_batch is already shape (n_quads, 4, 2)
+    verts_array = verts_batch
     
     # Pre-allocate output arrays
     vertices_flat = np.empty(n_quads * 12, dtype=np.float32)  # 6 vertices * 2 coords
@@ -2114,6 +2170,7 @@ def stream_level2_rays():
 def get_radar_data_webgl(site_id):
     product = request.args.get('product', 'N0B')
     format_type = request.args.get('format', 'json')  # 'json' or 'binary'
+    gzip_enabled = request.args.get('gzip', '0') == '1'
     specific_key = request.args.get('key', None)  # Optional: specific radar file key
     refresh_rev = request.args.get('rev', None)  # Optional: revision token for same-key updates
     source = _normalize_radar_source(request.args.get('source', 'level3'))
@@ -2145,7 +2202,7 @@ def get_radar_data_webgl(site_id):
         file_stats = os.stat(radar_file_path)
         file_size = int(file_stats.st_size)
         file_mtime = file_stats.st_mtime
-        cache_key = f"{source}:{site_id}:{product}:{key}:{file_size}:{file_mtime}"
+        cache_key = f"{source}:{site_id}:{product}:{key}:{file_size}:{file_mtime}:gzip{int(gzip_enabled)}"
         print(f"⏱️  Key lookup + download: {(time.time() - t_key)*1000:.1f}ms")
         
         # CHECK CACHE: cache now stores GZIPPED BYTES, not raw arrays
@@ -2156,7 +2213,7 @@ def get_radar_data_webgl(site_id):
                 print(f"⏱️  TOTAL (cached): {(time.time() - t_start)*1000:.1f}ms")
 
                 if format_type == 'binary':
-                    return create_binary_response_from_blob(compressed_blob)
+                    return create_binary_response_from_blob(compressed_blob, is_gzipped=gzip_enabled)
                 else:
                     return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
         
@@ -2208,7 +2265,9 @@ def get_radar_data_webgl(site_id):
         
         # 2. GENERATE BLOB & CACHE
         try:
-            compressed_blob = generate_binary_blob(vertices, values)
+            t_blob = time.time()
+            compressed_blob = generate_binary_blob(vertices, values, use_gzip=gzip_enabled)
+            print(f"⏱️  Binary blob ({'gzip' if gzip_enabled else 'raw'}): {(time.time() - t_blob)*1000:.1f}ms")
 
             # Free raw arrays immediately
             try:
@@ -2229,14 +2288,14 @@ def get_radar_data_webgl(site_id):
         print(f"⏱️  TOTAL (uncached): {(time.time() - t_start)*1000:.1f}ms")
 
         if format_type == 'binary':
-            return create_binary_response_from_blob(compressed_blob)
+            return create_binary_response_from_blob(compressed_blob, is_gzipped=gzip_enabled)
         else:
             return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
-def generate_binary_blob(vertices, values):
+def generate_binary_blob(vertices, values, use_gzip=False):
     """
     Generates the compressed binary blob from numpy arrays.
     Returns: bytes (gzipped)
@@ -2244,9 +2303,9 @@ def generate_binary_blob(vertices, values):
     import struct
     import gzip
 
-    # Ensure float32
-    vertices_array = np.array(vertices, dtype=np.float32)
-    values_array = np.array(values, dtype=np.float32)
+    # Ensure float32 without unnecessary copies.
+    vertices_array = np.asarray(vertices, dtype=np.float32)
+    values_array = np.asarray(values, dtype=np.float32)
 
     vertex_count = len(values_array)
 
@@ -2257,22 +2316,26 @@ def generate_binary_blob(vertices, values):
     # 3. Values
     binary_data.extend(values_array.tobytes())
 
-    # Compress immediately to save RAM
-    return gzip.compress(bytes(binary_data), compresslevel=6)
+    payload = bytes(binary_data)
+    if use_gzip:
+        # Favor speed over max compression ratio for lower request latency.
+        return gzip.compress(payload, compresslevel=1)
+    return payload
 
 
-def create_binary_response_from_blob(compressed_bytes, extra_headers=None):
+def create_binary_response_from_blob(payload_bytes, extra_headers=None, is_gzipped=False):
     """Wraps cached compressed bytes into a Flask Response."""
     response_headers = {
         'Content-Type': 'application/octet-stream',
-        'Content-Encoding': 'gzip',
-        'Content-Length': str(len(compressed_bytes))
+        'Content-Length': str(len(payload_bytes))
     }
+    if is_gzipped:
+        response_headers['Content-Encoding'] = 'gzip'
     if extra_headers:
         response_headers.update(extra_headers)
 
     return Response(
-        compressed_bytes,
+        payload_bytes,
         mimetype='application/octet-stream',
         headers=response_headers
     )
@@ -2280,11 +2343,16 @@ def create_binary_response_from_blob(compressed_bytes, extra_headers=None):
 
 def cleanup_temp_files():
     """Removes files in ./temp older than 5 minutes."""
+    global last_temp_cleanup_ts
+    now = time.time()
+    if (now - last_temp_cleanup_ts) < TEMP_CLEANUP_INTERVAL_SEC:
+        return
+    last_temp_cleanup_ts = now
+
     temp_path = Path("./temp")
     if not temp_path.exists():
         return
-    
-    now = time.time()
+
     try:
         for p in temp_path.rglob("*"):
             if p.is_file():
@@ -2300,8 +2368,8 @@ def cleanup_temp_files():
 
 # Backwards-compatible helper for existing call sites: builds blob then response
 def create_binary_response(vertices, values, extra_headers=None):
-    compressed = generate_binary_blob(vertices, values)
-    return create_binary_response_from_blob(compressed, extra_headers=extra_headers)
+    payload = generate_binary_blob(vertices, values)
+    return create_binary_response_from_blob(payload, extra_headers=extra_headers)
 
 
 def _normalize_hrrr_date(date_str):
