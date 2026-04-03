@@ -26,6 +26,8 @@ import struct
 import gzip
 import shutil
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Event
 
 try:
     import xarray as xr
@@ -112,7 +114,11 @@ level2_download_locks_lock = Lock()
 # Cache for processed WebGL data to avoid reprocessing
 processed_data_cache = OrderedDict()
 processed_data_lock = Lock()
-PROCESSED_CACHE_MAX_SIZE = 5  # Keep last 5 processed radar scans (Railway friendly)
+PROCESSED_CACHE_MAX_SIZE = 64
+RADAR_BATCH_MAX_KEYS = 48
+RADAR_BATCH_MAX_WORKERS = 6
+radar_blob_inflight = {}
+radar_blob_inflight_lock = Lock()
 TEMP_CLEANUP_INTERVAL_SEC = 60
 last_temp_cleanup_ts = 0.0
 
@@ -733,21 +739,9 @@ def download_radar_file_by_key(key, *, use_cache=True):
     temp_path.parent.mkdir(parents=True, exist_ok=True)
 
     if use_cache and temp_path.exists() and temp_path.stat().st_size > 0:
-        local_size = temp_path.stat().st_size
-        try:
-            head_resp = http_session.head(file_url, timeout=2.0, allow_redirects=True)
-            remote_size = int(head_resp.headers.get('Content-Length', 0))
-            head_resp.close()
-
-            if remote_size > 0 and local_size == remote_size:
-                print(f"♻️  Reusing cached radar file {key} (size match)")
-                return str(temp_path)
-
-            print(f"🔄 Radar cache mismatch for {key}: local={local_size}, remote={remote_size}. Redownloading.")
-        except Exception as e:
-            # Prefer serving cached copy over failing requests if metadata check fails.
-            print(f"⚠️  Radar cache HEAD check failed ({e}); using cached file for {key}")
-            return str(temp_path)
+        # Level-3 keys include timestamps and are effectively immutable.
+        # Avoiding a HEAD check removes one network round trip per frame.
+        return str(temp_path)
 
     print(f"✅ Fetching radar file: {file_url}")
 
@@ -2172,120 +2166,22 @@ def get_radar_data_webgl(site_id):
     format_type = request.args.get('format', 'json')  # 'json' or 'binary'
     gzip_enabled = request.args.get('gzip', '0') == '1'
     specific_key = request.args.get('key', None)  # Optional: specific radar file key
-    refresh_rev = request.args.get('rev', None)  # Optional: revision token for same-key updates
     source = _normalize_radar_source(request.args.get('source', 'level3'))
-    
-    t_start = time.time()
-    # Aggressive temp cleanup to avoid disk bloat on constrained hosts
+
     try:
+        # Aggressive temp cleanup to avoid disk bloat on constrained hosts
         cleanup_temp_files()
     except Exception:
         pass
+
     try:
-        # If a specific key is provided, use it; otherwise get the latest
-        t_key = time.time()
-        if source == 'level2':
-            if specific_key:
-                key = os.path.basename(specific_key)
-                radar_file_path = download_level2_file_by_name(site_id, key, skip_corrupted=True)
-            else:
-                key = get_latest_level2_file(site_id)
-                radar_file_path = download_level2_file_by_name(site_id, key, skip_corrupted=True)
-        else:
-            if specific_key:
-                key = specific_key
-                radar_file_path = download_radar_file_by_key(specific_key)
-            else:
-                key = get_latest_radar_key(site_id, product)
-                radar_file_path = download_radar_file_by_key(key)
-
-        file_stats = os.stat(radar_file_path)
-        file_size = int(file_stats.st_size)
-        file_mtime = file_stats.st_mtime
-        cache_key = f"{source}:{site_id}:{product}:{key}:{file_size}:{file_mtime}:gzip{int(gzip_enabled)}"
-        print(f"⏱️  Key lookup + download: {(time.time() - t_key)*1000:.1f}ms")
-        
-        # CHECK CACHE: cache now stores GZIPPED BYTES, not raw arrays
-        with processed_data_lock:
-            if cache_key in processed_data_cache:
-                print(f"🚀 Using cached processed data for {cache_key}")
-                compressed_blob = processed_data_cache[cache_key]
-                print(f"⏱️  TOTAL (cached): {(time.time() - t_start)*1000:.1f}ms")
-
-                if format_type == 'binary':
-                    return create_binary_response_from_blob(compressed_blob, is_gzipped=gzip_enabled)
-                else:
-                    return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
-        
-        # Process the radar data
-        t_parse = time.time()
-        t_convert = time.time()
-        if source == 'level2':
-            import nexrad_level2
-            try:
-                radar_data = nexrad_level2.NEXRADLevel2File(radar_file_path)
-            except (ValueError, RuntimeError) as e:
-                # File failed to parse - likely corrupted or incomplete
-                # Try to re-download without cache
-                print(f"❌ Failed to parse Level 2 file: {e}")
-                print(f"🔄 Re-downloading {key} without cache...")
-                try:
-                    if specific_key:
-                        radar_file_path = download_level2_file_by_name(site_id, key, use_cache=False)
-                    else:
-                        radar_file_path = download_level2_file_by_name(site_id, key, use_cache=False)
-                    radar_data = nexrad_level2.NEXRADLevel2File(radar_file_path)
-                except Exception as retry_error:
-                    print(f"❌ Re-download also failed: {retry_error}")
-                    raise ValueError(f"Failed to retrieve valid Level 2 data for {site_id}: {str(e)}")
-            
-            azimuths, ranges, radar_values = _extract_level2_radar_data(radar_data, product)
-            if azimuths is None or ranges is None or radar_values is None:
-                raise ValueError(f"No Level 2 radar data available for {site_id} ({product})")
-
-            class _Level2Adapter:
-                pass
-
-            adapter = _Level2Adapter()
-            adapter.level2_arrays = (azimuths, ranges, radar_values)
-            vertices, values = convert_radar_to_webgl_data(adapter, site_id, product)
-
-            try:
-                radar_data.close()
-            except Exception:
-                pass
-        else:
-            if product.startswith('N0'):
-                radar_data = nexrad.Level3File(radar_file_path)
-            else:
-                radar_data = nexrad.Level2File(radar_file_path)
-            print(f"⏱️  Radar file parse: {(time.time() - t_parse)*1000:.1f}ms")
-            vertices, values = convert_radar_to_webgl_data(radar_data, site_id, product)
-        print(f"⏱️  Convert to WebGL: {(time.time() - t_convert)*1000:.1f}ms")
-        
-        # 2. GENERATE BLOB & CACHE
-        try:
-            t_blob = time.time()
-            compressed_blob = generate_binary_blob(vertices, values, use_gzip=gzip_enabled)
-            print(f"⏱️  Binary blob ({'gzip' if gzip_enabled else 'raw'}): {(time.time() - t_blob)*1000:.1f}ms")
-
-            # Free raw arrays immediately
-            try:
-                del vertices
-                del values
-            except Exception:
-                pass
-            gc.collect()
-
-            with processed_data_lock:
-                processed_data_cache[cache_key] = compressed_blob
-                # Prune cache (OrderedDict)
-                if len(processed_data_cache) > PROCESSED_CACHE_MAX_SIZE:
-                    processed_data_cache.popitem(last=False)
-        except Exception as e:
-            print(f"❌ Failed to generate binary blob: {e}")
-            return jsonify({"error": "Failed to generate binary blob"}), 500
-        print(f"⏱️  TOTAL (uncached): {(time.time() - t_start)*1000:.1f}ms")
+        _, compressed_blob, _ = _get_or_build_radar_blob(
+            site_id=site_id,
+            product=product,
+            source=source,
+            specific_key=specific_key,
+            gzip_enabled=gzip_enabled,
+        )
 
         if format_type == 'binary':
             return create_binary_response_from_blob(compressed_blob, is_gzipped=gzip_enabled)
@@ -2294,6 +2190,95 @@ def get_radar_data_webgl(site_id):
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/radar-webgl-batch/<site_id>', methods=['POST'])
+def get_radar_data_webgl_batch(site_id):
+    payload = request.get_json(silent=True) or {}
+    product = str(payload.get('product') or 'N0B').strip().upper()
+    source = _normalize_radar_source(payload.get('source', 'level3'))
+    gzip_enabled = bool(payload.get('gzip', False))
+    include_payload = bool(payload.get('includePayload', True))
+    keys = payload.get('keys') or []
+    max_workers = int(payload.get('maxWorkers') or RADAR_BATCH_MAX_WORKERS)
+
+    if not isinstance(keys, list) or not keys:
+        return jsonify({"error": "Request body must include a non-empty keys array."}), 400
+
+    keys = [str(k).strip() for k in keys if str(k).strip()]
+    if not keys:
+        return jsonify({"error": "No valid keys were provided."}), 400
+
+    if len(keys) > RADAR_BATCH_MAX_KEYS:
+        return jsonify({"error": f"Too many keys. Max {RADAR_BATCH_MAX_KEYS}."}), 400
+
+    max_workers = max(1, min(RADAR_BATCH_MAX_WORKERS, max_workers, len(keys)))
+    started = time.time()
+
+    try:
+        cleanup_temp_files()
+    except Exception:
+        pass
+
+    def _process(single_key):
+        item_start = time.time()
+        try:
+            resolved_key, blob, cache_hit = _get_or_build_radar_blob(
+                site_id=site_id,
+                product=product,
+                source=source,
+                specific_key=single_key,
+                gzip_enabled=gzip_enabled,
+            )
+
+            result = {
+                "key": resolved_key,
+                "status": "ok",
+                "cacheHit": bool(cache_hit),
+                "byteLength": len(blob),
+                "elapsedMs": int((time.time() - item_start) * 1000),
+                "isGzipped": bool(gzip_enabled),
+            }
+            if include_payload:
+                result["payloadBase64"] = base64.b64encode(blob).decode('ascii')
+            return result
+        except Exception as err:
+            return {
+                "key": single_key,
+                "status": "error",
+                "error": str(err),
+                "elapsedMs": int((time.time() - item_start) * 1000),
+            }
+
+    results = [None] * len(keys)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process, key): idx
+            for idx, key in enumerate(keys)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as err:
+                results[idx] = {
+                    "key": keys[idx],
+                    "status": "error",
+                    "error": str(err),
+                    "elapsedMs": 0,
+                }
+
+    ok_count = sum(1 for r in results if r and r.get("status") == "ok")
+    return jsonify({
+        "siteId": site_id,
+        "product": product,
+        "source": source,
+        "count": len(results),
+        "okCount": ok_count,
+        "errorCount": len(results) - ok_count,
+        "elapsedMs": int((time.time() - started) * 1000),
+        "results": results,
+    })
 
 def generate_binary_blob(vertices, values, use_gzip=False):
     """
@@ -2339,6 +2324,122 @@ def create_binary_response_from_blob(payload_bytes, extra_headers=None, is_gzipp
         mimetype='application/octet-stream',
         headers=response_headers
     )
+
+
+def _build_radar_cache_key(site_id, product, source, key, file_size, file_mtime, gzip_enabled):
+    return f"{source}:{site_id}:{product}:{key}:{int(file_size)}:{float(file_mtime):.6f}:gzip{int(bool(gzip_enabled))}"
+
+
+def _resolve_radar_file(site_id, product, source, specific_key):
+    if source == 'level2':
+        if specific_key:
+            key = os.path.basename(specific_key)
+            radar_file_path = download_level2_file_by_name(site_id, key, skip_corrupted=True)
+        else:
+            key = get_latest_level2_file(site_id)
+            radar_file_path = download_level2_file_by_name(site_id, key, skip_corrupted=True)
+    else:
+        if specific_key:
+            key = specific_key
+            radar_file_path = download_radar_file_by_key(specific_key)
+        else:
+            key = get_latest_radar_key(site_id, product)
+            radar_file_path = download_radar_file_by_key(key)
+    return key, radar_file_path
+
+
+def _decode_to_webgl_arrays(radar_file_path, site_id, product, source):
+    if source == 'level2':
+        import nexrad_level2
+        radar_data = nexrad_level2.NEXRADLevel2File(radar_file_path)
+        try:
+            azimuths, ranges, radar_values = _extract_level2_radar_data(radar_data, product)
+            if azimuths is None or ranges is None or radar_values is None:
+                raise ValueError(f"No Level 2 radar data available for {site_id} ({product})")
+
+            class _Level2Adapter:
+                pass
+
+            adapter = _Level2Adapter()
+            adapter.level2_arrays = (azimuths, ranges, radar_values)
+            return convert_radar_to_webgl_data(adapter, site_id, product)
+        finally:
+            try:
+                radar_data.close()
+            except Exception:
+                pass
+
+    if product.startswith('N0'):
+        radar_data = nexrad.Level3File(radar_file_path)
+    else:
+        radar_data = nexrad.Level2File(radar_file_path)
+    return convert_radar_to_webgl_data(radar_data, site_id, product)
+
+
+def _get_or_build_radar_blob(site_id, product, source, specific_key=None, gzip_enabled=False):
+    key, radar_file_path = _resolve_radar_file(site_id, product, source, specific_key)
+
+    file_stats = os.stat(radar_file_path)
+    cache_key = _build_radar_cache_key(
+        site_id=site_id,
+        product=product,
+        source=source,
+        key=key,
+        file_size=file_stats.st_size,
+        file_mtime=file_stats.st_mtime,
+        gzip_enabled=gzip_enabled,
+    )
+
+    with processed_data_lock:
+        cached = processed_data_cache.get(cache_key)
+        if cached is not None:
+            return key, cached, True
+
+    inflight_event = None
+    is_owner = False
+    with radar_blob_inflight_lock:
+        inflight_event = radar_blob_inflight.get(cache_key)
+        if inflight_event is None:
+            inflight_event = Event()
+            radar_blob_inflight[cache_key] = inflight_event
+            is_owner = True
+
+    if not is_owner:
+        inflight_event.wait(timeout=15.0)
+        with processed_data_lock:
+            cached = processed_data_cache.get(cache_key)
+            if cached is not None:
+                return key, cached, True
+
+    try:
+        vertices, values = _decode_to_webgl_arrays(
+            radar_file_path=radar_file_path,
+            site_id=site_id,
+            product=product,
+            source=source,
+        )
+        blob = generate_binary_blob(vertices, values, use_gzip=gzip_enabled)
+
+        try:
+            del vertices
+            del values
+        except Exception:
+            pass
+
+        with processed_data_lock:
+            processed_data_cache[cache_key] = blob
+            processed_data_cache.move_to_end(cache_key)
+            while len(processed_data_cache) > PROCESSED_CACHE_MAX_SIZE:
+                processed_data_cache.popitem(last=False)
+
+        gc.collect()
+        return key, blob, False
+    finally:
+        if is_owner:
+            with radar_blob_inflight_lock:
+                event = radar_blob_inflight.pop(cache_key, None)
+                if event is not None:
+                    event.set()
 
 
 def cleanup_temp_files():
@@ -3500,7 +3601,7 @@ if __name__ == '__main__':
     print(f"📡 Level 2 Update Mode: On-demand request checks")
     print(f"🌐 Server: http://localhost:5100")
     print("=" * 60)
-    app.run(debug=True, port=5100)
+    app.run(debug=True, port=5100, threaded=True)
     
 #conda activate radar_api_env
 #python app.py
