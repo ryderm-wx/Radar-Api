@@ -157,7 +157,7 @@ def _http_get_with_retry(url, max_retries=3, **kwargs):
 
 # Text parsing functions removed - using IEM SBW GeoJSON API instead
 
-def _list_radar_keys(prefix, max_keys=1000, start_after=None):
+def _list_radar_keys(prefix, max_keys=1000, start_after=None, continuation_token=None):
     params = {
         'list-type': '2',
         'prefix': prefix,
@@ -165,12 +165,43 @@ def _list_radar_keys(prefix, max_keys=1000, start_after=None):
     }
     if start_after:
         params['start-after'] = start_after
+    if continuation_token:
+        params['continuation-token'] = continuation_token
 
     response = _http_get(NEXRAD_BUCKET_BASE, params=params)
     response.raise_for_status()
     root = ET.fromstring(response.content)
     keys = [elem.text for elem in root.findall('s3:Contents/s3:Key', S3_NS) if elem.text]
-    return keys
+    is_truncated = root.findtext('s3:IsTruncated', default='false', namespaces=S3_NS).lower() == 'true'
+    next_token = root.findtext('s3:NextContinuationToken', default=None, namespaces=S3_NS)
+    return keys, is_truncated, next_token
+
+
+def _get_latest_radar_key_for_prefix(prefix, start_after=None, max_pages=24):
+    """Return the newest key for a prefix by following S3 pagination."""
+    continuation_token = None
+    effective_start_after = start_after
+    newest_key = None
+
+    for _ in range(max_pages):
+        keys, is_truncated, next_token = _list_radar_keys(
+            prefix,
+            max_keys=1000,
+            start_after=effective_start_after,
+            continuation_token=continuation_token,
+        )
+
+        if keys:
+            newest_key = keys[-1]
+
+        if not is_truncated or not next_token:
+            break
+
+        # start-after is only valid for the first request in a paginated sequence.
+        continuation_token = next_token
+        effective_start_after = None
+
+    return newest_key
 
 
 def _list_s3_objects(base_url, prefix, max_keys=1000, start_after=None, continuation_token=None, delimiter=None):
@@ -576,32 +607,35 @@ def get_latest_radar_key(site_id, product, date=None):
             incremental_prefix = None
 
         try:
-            incremental = _list_radar_keys(incremental_prefix, max_keys=200, start_after=last_known_key) if incremental_prefix else []
+            incremental_latest = _get_latest_radar_key_for_prefix(
+                incremental_prefix,
+                start_after=last_known_key,
+            ) if incremental_prefix else None
         except Exception:
             # If incremental listing fails, force a full refresh below.
-            incremental = None
+            incremental_latest = None
 
-        if incremental:
-            latest_key = incremental[-1]
-        elif incremental == [] and (now - last_checked) < RADAR_KEY_CACHE_MAX_AGE:
+        if incremental_latest:
+            latest_key = incremental_latest
+        elif incremental_latest is None and (now - last_checked) < RADAR_KEY_CACHE_MAX_AGE:
             _cache_latest_key(cache_key, last_known_key)
             return last_known_key
 
     if latest_key is None:
         if date is not None:
-            keys = _list_radar_keys(f"{site_id}_{product}_{date}")
-            if not keys:
+            latest_for_day = _get_latest_radar_key_for_prefix(f"{site_id}_{product}_{date}")
+            if not latest_for_day:
                 raise FileNotFoundError(f"No radar files found for prefix {site_id}_{product}_{date}")
-            latest_key = keys[-1]
+            latest_key = latest_for_day
         else:
             now_utc = datetime.now(timezone.utc)
             candidates = []
             for day_offset in range(0, RADAR_KEY_LOOKBACK_DAYS + 1):
                 day = (now_utc - timedelta(days=day_offset)).strftime("%Y_%m_%d")
                 day_prefix = f"{site_id}_{product}_{day}"
-                keys = _list_radar_keys(day_prefix)
-                if keys:
-                    candidates.append(keys[-1])
+                latest_for_day = _get_latest_radar_key_for_prefix(day_prefix)
+                if latest_for_day:
+                    candidates.append(latest_for_day)
 
             if not candidates:
                 raise FileNotFoundError(f"No radar files found for {site_id} {product} in recent dates")
@@ -610,6 +644,17 @@ def get_latest_radar_key(site_id, product, date=None):
                 candidates,
                 key=lambda k: _parse_timestamp_from_key(k) or datetime.min.replace(tzinfo=timezone.utc)
             )
+
+    # Use ThreadPoolExecutor to start downloading to cache immediately in background
+    # This helps when the frontend follows up with the status/data request
+    def _background_download(key_to_dl):
+        try:
+            download_radar_file_by_key(key_to_dl)
+        except Exception:
+            pass
+    
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(_background_download, latest_key)
 
     _cache_latest_key(cache_key, latest_key)
     return latest_key
@@ -1866,8 +1911,13 @@ def convert_radar_to_webgl_data(radar_data, site_id, product='N0B'):
 def get_latest_radar_key_api(site_id):
     product = request.args.get('product', 'N0B')
     source = _normalize_radar_source(request.args.get('source', 'level3'))
+    fresh = request.args.get('fresh', '0') == '1'
     try:
         if source == 'level2':
+            if fresh:
+                normalized_site = _normalize_level2_site_id(site_id)
+                with level2_dirlist_cache_lock:
+                    level2_dirlist_cache.pop((normalized_site,), None)
             key = get_latest_level2_file(site_id)
             try:
                 token, complete, coverage, rays, prod_bytes = _build_level2_tilt_update_token(site_id, product, key)
@@ -1883,6 +1933,12 @@ def get_latest_radar_key_api(site_id):
                 "prodBytes": prod_bytes,
             })
         else:
+            if fresh:
+                normalized_site = site_id.upper()
+                normalized_product = product.upper()
+                cache_key = (normalized_site, normalized_product, "latest")
+                with latest_key_lock:
+                    latest_key_cache.pop(cache_key, None)
             key = get_latest_radar_key(site_id, product)
         return jsonify({"key": key, "updateToken": key})
     except Exception as e:
