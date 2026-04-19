@@ -2643,11 +2643,14 @@ def generate_binary_blob(vertices, values, use_gzip=False):
     if use_gzip:
         # Favor speed over max compression ratio for lower request latency.
         return gzip.compress(binary_data, compresslevel=1)
-    return binary_data
+    return bytes(binary_data)
 
 
 def create_binary_response_from_blob(payload_bytes, extra_headers=None, is_gzipped=False):
     """Wraps cached compressed bytes into a Flask Response."""
+    if not isinstance(payload_bytes, bytes):
+        payload_bytes = bytes(payload_bytes)
+
     response_headers = {
         'Content-Type': 'application/octet-stream',
         'Content-Length': str(len(payload_bytes))
@@ -2979,7 +2982,7 @@ def generate_radial_binary_blob(site_id, product, source, key, azimuths, ranges,
 
     if use_gzip:
         return gzip.compress(header, compresslevel=1), mesh_id
-    return header, mesh_id
+    return bytes(header), mesh_id
 
 
 def _build_radial_scan_cache_key(site_id, product, key):
