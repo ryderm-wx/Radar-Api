@@ -6,7 +6,7 @@ import gc  # <--- NEW IMPORT
 import sys
 import os
 import time
-from threading import Lock
+from threading import Lock, Thread, get_ident
 from pathlib import Path
 import requests
 from requests.adapters import HTTPAdapter
@@ -38,6 +38,17 @@ app = Flask(__name__)
 CORS(app)
 Compress(app)  # <--- Enable GZIP compression for all routes
 
+
+def _env_int(name, default, minimum=1):
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(raw)
+    except Exception:
+        return default
+    return max(minimum, value)
+
 NEXRAD_BUCKET_BASE = "https://unidata-nexrad-level3.s3.amazonaws.com"
 NEXRAD_LEVEL2_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/radar/nexrad_level2"
 S3_NS = {'s3': 'http://s3.amazonaws.com/doc/2006-03-01/'}
@@ -58,6 +69,7 @@ MRMS_PRODUCT_PATH = "CONUS/SeamlessHSR_00.00"
 HRRR_IDX_CACHE_TTL = 60
 HRRR_MAX_FORECAST_HOUR = 48
 HRRR_PROCESSED_CACHE_MAX_SIZE = 2
+HRRR_PROCESSED_CACHE_MAX_BYTES = _env_int("HRRR_PROCESSED_CACHE_MAX_BYTES", 192 * 1024 * 1024)
 HRRR_REFC_MIN_DBZ = 0.0
 HRRR_DEFAULT_LOOKBACK_HOURS = 48
 HRRR_DEFAULT_RUNS_MAX = 12
@@ -110,15 +122,36 @@ level2_dirlist_cache = {}
 level2_dirlist_cache_lock = Lock()
 level2_download_locks = {}
 level2_download_locks_lock = Lock()
+level3_download_locks = {}
+level3_download_locks_lock = Lock()
 
 # Cache for processed WebGL data to avoid reprocessing
 processed_data_cache = OrderedDict()
 processed_data_lock = Lock()
-PROCESSED_CACHE_MAX_SIZE = 64
+PROCESSED_CACHE_MAX_SIZE = _env_int("PROCESSED_CACHE_MAX_SIZE", 16)
+PROCESSED_CACHE_MAX_BYTES = _env_int("PROCESSED_CACHE_MAX_BYTES", 96 * 1024 * 1024)
 RADAR_BATCH_MAX_KEYS = 48
-RADAR_BATCH_MAX_WORKERS = 6
+RADAR_BATCH_MAX_WORKERS = _env_int("RADAR_BATCH_MAX_WORKERS", 3)
+RADAR_BATCH_DEFAULT_INCLUDE_PAYLOAD = os.getenv("RADAR_BATCH_DEFAULT_INCLUDE_PAYLOAD", "0") == "1"
 radar_blob_inflight = {}
 radar_blob_inflight_lock = Lock()
+
+# Radial mesh-values protocol cache (site+product+key ownership)
+RADIAL_MAGIC = 0x52414452  # 'RADR'
+RADIAL_PROTOCOL_VERSION = 1
+RADIAL_SCAN_CACHE_MAX_SIZE = _env_int("RADIAL_SCAN_CACHE_MAX_SIZE", 24)
+RADIAL_SCAN_CACHE_MAX_BYTES = _env_int("RADIAL_SCAN_CACHE_MAX_BYTES", 160 * 1024 * 1024)
+radial_scan_cache = OrderedDict()
+radial_scan_cache_lock = Lock()
+
+# Background watch registry for prefetching newest scans
+radial_watch_registry = set()
+radial_watch_registry_lock = Lock()
+radial_watch_thread_started = False
+RADIAL_WATCHER_INTERVAL_SEC = 1.0
+RADIAL_PREFETCH_FAILURE_BACKOFF_SEC = 20
+radial_prefetch_failures = {}
+radial_prefetch_failures_lock = Lock()
 TEMP_CLEANUP_INTERVAL_SEC = 60
 last_temp_cleanup_ts = 0.0
 
@@ -148,6 +181,43 @@ def _http_get_with_retry(url, max_retries=3, **kwargs):
             else:
                 print(f"❌ Download failed after {max_retries} attempts")
                 raise
+
+
+def _enforce_lru_limits(cache_obj, *, max_items, max_bytes, entry_size_bytes):
+    total_bytes = 0
+    for entry in cache_obj.values():
+        try:
+            total_bytes += int(entry_size_bytes(entry))
+        except Exception:
+            continue
+
+    while cache_obj and (len(cache_obj) > max_items or total_bytes > max_bytes):
+        _, evicted = cache_obj.popitem(last=False)
+        try:
+            total_bytes -= int(entry_size_bytes(evicted))
+        except Exception:
+            pass
+
+
+def _processed_blob_size_bytes(blob):
+    return len(blob) if blob is not None else 0
+
+
+def _radial_entry_size_bytes(entry):
+    if not isinstance(entry, dict):
+        return 0
+    blob = entry.get('blob')
+    return len(blob) if blob is not None else 0
+
+
+def _hrrr_entry_size_bytes(entry):
+    if not isinstance(entry, tuple) or len(entry) < 2:
+        return 0
+    vertices = entry[0]
+    values = entry[1]
+    v_bytes = int(getattr(vertices, 'nbytes', 0) or 0)
+    val_bytes = int(getattr(values, 'nbytes', 0) or 0)
+    return v_bytes + val_bytes
 
 # --- IEM NWS Text utilities ---
 
@@ -790,26 +860,80 @@ def download_radar_file_by_key(key, *, use_cache=True):
 
     print(f"✅ Fetching radar file: {file_url}")
 
-    temp_path_tmp = temp_path.parent / f"{temp_path.name}.part"
-    if temp_path_tmp.exists():
-        temp_path_tmp.unlink(missing_ok=True)
+    def _unlink_with_retries(path_obj, attempts=4, wait_sec=0.08):
+        for idx in range(attempts):
+            try:
+                path_obj.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                if idx >= attempts - 1:
+                    raise
+                time.sleep(wait_sec * (idx + 1))
 
-    response = _http_get(file_url, stream=True)
-    try:
-        response.raise_for_status()
-        with open(temp_path_tmp, 'wb') as f:
-            for chunk in response.iter_content(STREAM_CHUNK_SIZE):
-                if chunk:
-                    f.write(chunk)
-    except Exception:
+    def _replace_with_retries(src_path, dst_path, attempts=4, wait_sec=0.08):
+        for idx in range(attempts):
+            try:
+                src_path.replace(dst_path)
+                return True
+            except PermissionError:
+                if idx >= attempts - 1:
+                    return False
+                time.sleep(wait_sec * (idx + 1))
+        return False
+
+    lock_key = key
+    with level3_download_locks_lock:
+        file_lock = level3_download_locks.get(lock_key)
+        if file_lock is None:
+            file_lock = Lock()
+            level3_download_locks[lock_key] = file_lock
+
+    with file_lock:
+        # Another request may have completed while we waited.
+        if use_cache and temp_path.exists() and temp_path.stat().st_size > 0:
+            return str(temp_path)
+
+        temp_path_tmp = temp_path.parent / (
+            f"{temp_path.name}.part.{os.getpid()}.{get_ident()}.{time.time_ns()}"
+        )
+
+        response = _http_get(file_url, stream=True)
+        try:
+            response.raise_for_status()
+            with open(temp_path_tmp, 'wb') as f:
+                for chunk in response.iter_content(STREAM_CHUNK_SIZE):
+                    if chunk:
+                        f.write(chunk)
+        except Exception:
+            if temp_path_tmp.exists():
+                try:
+                    _unlink_with_retries(temp_path_tmp)
+                except Exception:
+                    pass
+            raise
+        finally:
+            response.close()
+
+        moved = _replace_with_retries(temp_path_tmp, temp_path)
+        if moved:
+            return str(temp_path)
+
+        # If destination is temporarily locked, fall back to existing cached file.
+        if use_cache and temp_path.exists() and temp_path.stat().st_size > 0:
+            try:
+                _unlink_with_retries(temp_path_tmp)
+            except Exception:
+                pass
+            print(f"⚠️  Destination temporarily locked; using cached file for {key}")
+            return str(temp_path)
+
+        # Best effort cleanup before surfacing error.
         if temp_path_tmp.exists():
-            temp_path_tmp.unlink(missing_ok=True)
-        raise
-    finally:
-        response.close()
-
-    temp_path_tmp.replace(temp_path)
-    return str(temp_path)
+            try:
+                _unlink_with_retries(temp_path_tmp)
+            except Exception:
+                pass
+        raise PermissionError(f"Unable to finalize download for {key} due to file lock")
 
 
 def _parse_timestamp_from_key(key):
@@ -1166,7 +1290,9 @@ class Level2StreamMonitor:
         self.site_id = site_id
         self.filename = filename
         self.downloaded_bytes = 0
-        self.sweep_ray_tracker = {}  # { sweep_index: last_seen_ray_count } - tracks growth per sweep
+        # Tracks per-sweep growth and identity so multiple scans in one file are detected.
+        # { sweep_index: {ray_count, signature, msg_time, is_full, coverage_deg} }
+        self.sweep_ray_tracker = {}
         self._radar = None
         self._radar_size = 0
         self._radar_needs_reload = False
@@ -1293,7 +1419,30 @@ class Level2StreamMonitor:
 
                     return None
 
-                # FIX: Check ALL sweeps in the file for growth, not just new indices
+                def _safe_time_pair(msg_header, day_key, ms_key):
+                    if not isinstance(msg_header, dict):
+                        return None
+                    day = msg_header.get(day_key)
+                    ms = msg_header.get(ms_key)
+                    try:
+                        if day is None or ms is None:
+                            return None
+                        return (int(day), int(ms))
+                    except Exception:
+                        return None
+
+                def _select_latest_time(*pairs):
+                    valid = [p for p in pairs if p is not None]
+                    return max(valid) if valid else None
+
+                def _is_later(a, b):
+                    if a is None:
+                        return False
+                    if b is None:
+                        return True
+                    return a > b
+
+                # Check ALL sweeps in the file for growth and for new full-scan identity.
                 new_scans = []
                 for sweep_index in range(radar.nscans):
                     try:
@@ -1309,12 +1458,64 @@ class Level2StreamMonitor:
                         if elevation is None or abs(elevation - target_elevation) > 0.1:
                             continue
 
-                        # 2. FIX: Check if this specific sweep has NEW RAYS since last check
+                        # 2. Check if this specific sweep has NEW RAYS since last check
                         current_ray_count = len(radar.scan_msgs[sweep_index]) if sweep_index < len(radar.scan_msgs) else 0
-                        last_ray_count = self.sweep_ray_tracker.get(sweep_index, 0)
+                        tracker_entry = self.sweep_ray_tracker.get(sweep_index, {})
+                        last_ray_count = int(tracker_entry.get("ray_count", 0) or 0)
 
-                        if current_ray_count > last_ray_count:
-                            # This sweep has grown! Extract the whole thing (including the new parts)
+                        first_msg_hdr = None
+                        last_msg_hdr = None
+                        msg_indices = radar.scan_msgs[sweep_index] if sweep_index < len(radar.scan_msgs) else []
+                        if msg_indices:
+                            try:
+                                first_msg = radar.radial_records[msg_indices[0]]
+                                if isinstance(first_msg, dict):
+                                    first_msg_hdr = first_msg.get("msg_header")
+                            except Exception:
+                                first_msg_hdr = None
+                            try:
+                                last_msg = radar.radial_records[msg_indices[-1]]
+                                if isinstance(last_msg, dict):
+                                    last_msg_hdr = last_msg.get("msg_header")
+                            except Exception:
+                                last_msg_hdr = None
+
+                        # Build metadata-like timing keys when available.
+                        msg_time = _select_latest_time(
+                            _safe_time_pair(last_msg_hdr, "collect_date", "collect_time_ms"),
+                            _safe_time_pair(first_msg_hdr, "collect_date", "collect_time_ms"),
+                        )
+                        prod_time = _select_latest_time(
+                            _safe_time_pair(last_msg_hdr, "prod_date", "prod_time_ms"),
+                            _safe_time_pair(first_msg_hdr, "prod_date", "prod_time_ms"),
+                        )
+                        vol_time = _select_latest_time(
+                            _safe_time_pair(last_msg_hdr, "vol_date", "vol_time_ms"),
+                            _safe_time_pair(first_msg_hdr, "vol_date", "vol_time_ms"),
+                        )
+
+                        # If msg_time is later than prod/vol, treat it as a strong indicator
+                        # that this sweep contains a newer scan update.
+                        msg_is_later_than_prod_vol = bool(
+                            msg_time is not None
+                            and (prod_time is None or msg_time >= prod_time)
+                            and (vol_time is None or msg_time >= vol_time)
+                        )
+
+                        scan_signature = (
+                            current_ray_count,
+                            msg_time,
+                            prod_time,
+                            vol_time,
+                            _safe_time_pair(first_msg_hdr, "collect_date", "collect_time_ms"),
+                            _safe_time_pair(last_msg_hdr, "collect_date", "collect_time_ms"),
+                        )
+
+                        ray_growth = current_ray_count > last_ray_count
+                        full_signature_changed = scan_signature != tracker_entry.get("signature")
+
+                        if ray_growth or full_signature_changed:
+                            # Sweep grew OR full-scan identity changed: extract latest sweep data.
                             azimuths, ranges, values = _extract_level2_radar_data_with_sweep(
                                 radar,
                                 product,
@@ -1322,18 +1523,33 @@ class Level2StreamMonitor:
                             )
                             
                             if azimuths is not None and ranges is not None and values is not None:
-                                # Update the tracker so we only process if it grows further
-                                self.sweep_ray_tracker[sweep_index] = current_ray_count
-                                
-                                # Get timestamp
-                                timestamp = None
-                                if sweep_index < len(radar.scan_msgs) and len(radar.scan_msgs[sweep_index]) > 0:
-                                    first_msg_idx = radar.scan_msgs[sweep_index][0]
-                                    first_msg = radar.radial_records[first_msg_idx]
-                                    if "msg_header" in first_msg:
-                                        msg_hdr = first_msg["msg_header"]
-                                        if "collect_date" in msg_hdr and "collect_time_ms" in msg_hdr:
-                                            timestamp = (msg_hdr["collect_date"], msg_hdr["collect_time_ms"])
+                                coverage_deg = float(_compute_azimuth_coverage_degrees(azimuths))
+                                is_full_scan = coverage_deg >= LEVEL2_SWEEP_REQUIRED_COVERAGE_DEG
+
+                                # Qualify full scans by signature/time updates even when ray growth doesn't strictly increase.
+                                qualifies_new_full_scan = bool(
+                                    is_full_scan
+                                    and full_signature_changed
+                                    and (
+                                        _is_later(msg_time, tracker_entry.get("msg_time"))
+                                        or msg_is_later_than_prod_vol
+                                    )
+                                )
+
+                                should_emit = bool(ray_growth or qualifies_new_full_scan)
+                                if not should_emit:
+                                    continue
+
+                                # Update tracker so future checks compare against newest observed identity.
+                                self.sweep_ray_tracker[sweep_index] = {
+                                    "ray_count": current_ray_count,
+                                    "signature": scan_signature,
+                                    "msg_time": msg_time,
+                                    "is_full": is_full_scan,
+                                    "coverage_deg": coverage_deg,
+                                }
+
+                                timestamp = msg_time or _safe_time_pair(first_msg_hdr, "collect_date", "collect_time_ms")
                                 
                                 new_scans.append({
                                     "elevation": elevation,
@@ -1343,20 +1559,34 @@ class Level2StreamMonitor:
                                     "values": values,
                                     "ray_count": current_ray_count,
                                     "timestamp": timestamp,
+                                    "coverage_deg": coverage_deg,
+                                    "is_full_scan": bool(is_full_scan),
+                                    "scan_kind": "full" if is_full_scan else "partial",
+                                    "metadata_times": {
+                                        "msg_time": msg_time,
+                                        "prod_time": prod_time,
+                                        "vol_time": vol_time,
+                                        "msg_time_later_than_prod_vol": msg_is_later_than_prod_vol,
+                                    },
                                 })
                                 
-                                print(f"    ✨ Sweep {sweep_index}: {elevation:.1f}° ({current_ray_count} rays, was {last_ray_count})")
+                                reason = "growth" if ray_growth else "new_full_signature"
+                                print(
+                                    f"    ✨ Sweep {sweep_index}: {elevation:.1f}° "
+                                    f"({current_ray_count} rays, was {last_ray_count}, "
+                                    f"coverage={coverage_deg:.1f}°, kind={'full' if is_full_scan else 'partial'}, reason={reason})"
+                                )
                     
                     except Exception as e:
                         print(f"    ⚠️  Failed to extract sweep {sweep_index}: {e}")
                         continue
 
-                radar.close()
+                # Keep cached radar object open for reuse; cleanup() closes it when monitor rotates.
                 
                 if not new_scans:
                     return None
                 
-                print(f"  📦 Returning {len(new_scans)} scan(s) at {target_elevation:.1f}° with growth, file: {file_size:,} bytes")
+                print(f"  📦 Returning {len(new_scans)} scan(s) at {target_elevation:.1f}°, file: {file_size:,} bytes")
                 return {"scans": new_scans}
                 
             except (EOFError, OSError, ValueError, struct.error) as e:
@@ -1370,6 +1600,12 @@ class Level2StreamMonitor:
     def cleanup(self):
         """Remove temporary file."""
         try:
+            if self._radar:
+                try:
+                    self._radar.close()
+                except Exception:
+                    pass
+                self._radar = None
             if self.local_path.exists():
                 self.local_path.unlink(missing_ok=True)
         except Exception:
@@ -2106,9 +2342,10 @@ def stream_level2_rays():
                     for scan in new_payload['scans']:
                         # Compute azimuth coverage (client uses this to animate sweep)
                         try:
-                            coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
+                            coverage_deg = float(scan.get('coverage_deg', _compute_azimuth_coverage_degrees(scan.get('azimuths'))))
                         except Exception:
                             coverage_deg = 0.0
+                        is_full_scan = bool(scan.get('is_full_scan', coverage_deg >= LEVEL2_SWEEP_REQUIRED_COVERAGE_DEG))
 
                         formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
 
@@ -2128,8 +2365,9 @@ def stream_level2_rays():
                             'rayCount': int(len(scan.get('azimuths', []))),
                             'sweepAzimuth': sweep_az,
                             'sweepCoverageDeg': coverage_deg,
-                            'sweepComplete': bool(coverage_deg >= 359.5),
+                            'sweepComplete': is_full_scan,
                             'sweepRays': int(len(scan.get('azimuths', []))),
+                            'scanKind': 'full' if is_full_scan else 'partial',
                             'totalBytes': int(monitor.downloaded_bytes),
                             # Heavy payload removed to save egress and memory.
                             # Client should fetch binary blob via /api/radar-webgl/<site>
@@ -2140,7 +2378,7 @@ def stream_level2_rays():
 
                         # If this scan is partial, initialize/refresh rapid attempts counter
                         try:
-                            if coverage_deg > 0 and coverage_deg < 360:
+                            if not is_full_scan and coverage_deg > 0:
                                 monitor._rapid_attempts_left = 5
                         except Exception:
                             pass
@@ -2166,9 +2404,10 @@ def stream_level2_rays():
                         # Stream any newly grown scans immediately and refresh rapid counter
                         for scan in rapid_payload['scans']:
                             try:
-                                coverage_deg = float(_compute_azimuth_coverage_degrees(scan.get('azimuths')))
+                                coverage_deg = float(scan.get('coverage_deg', _compute_azimuth_coverage_degrees(scan.get('azimuths'))))
                             except Exception:
                                 coverage_deg = 0.0
+                            is_full_scan = bool(scan.get('is_full_scan', coverage_deg >= LEVEL2_SWEEP_REQUIRED_COVERAGE_DEG))
 
                             formatted_timestamp = format_nexrad_timestamp(scan.get('timestamp'))
 
@@ -2187,8 +2426,9 @@ def stream_level2_rays():
                                 'rayCount': int(len(scan.get('azimuths', []))),
                                 'sweepAzimuth': sweep_az2,
                                 'sweepCoverageDeg': coverage_deg,
-                                'sweepComplete': bool(coverage_deg >= 359.5),
+                                'sweepComplete': is_full_scan,
                                 'sweepRays': int(len(scan.get('azimuths', []))),
+                                'scanKind': 'full' if is_full_scan else 'partial',
                                 'totalBytes': int(monitor.downloaded_bytes),
                                 # Heavy payload removed; client should call /api/radar-webgl to fetch blob
                                 'fetchRequired': True,
@@ -2220,9 +2460,15 @@ def stream_level2_rays():
 def get_radar_data_webgl(site_id):
     product = request.args.get('product', 'N0B')
     format_type = request.args.get('format', 'json')  # 'json' or 'binary'
+    transport = (request.args.get('transport', '') or '').strip().lower()
     gzip_enabled = request.args.get('gzip', '0') == '1'
+    debug_enabled = request.args.get('debug', '0') == '1'
     specific_key = request.args.get('key', None)  # Optional: specific radar file key
     source = _normalize_radar_source(request.args.get('source', 'level3'))
+
+    # Keep Level-3 binary on the radial protocol unless explicitly overridden.
+    if not transport:
+        transport = 'radial' if (source == 'level3' and format_type == 'binary') else 'triangles'
 
     try:
         # Aggressive temp cleanup to avoid disk bloat on constrained hosts
@@ -2231,12 +2477,30 @@ def get_radar_data_webgl(site_id):
         pass
 
     try:
+        _ensure_radial_watcher_started()
+        _register_radial_watch_target(site_id, product, source)
+
+        use_radial = transport in ('radial', 'mesh-values', 'mesh_values')
+        if use_radial:
+            _, radial_blob, _ = _get_or_build_radar_radial_blob(
+                site_id=site_id,
+                product=product,
+                source=source,
+                specific_key=specific_key,
+                gzip_enabled=gzip_enabled,
+                debug=debug_enabled,
+            )
+            if format_type == 'binary':
+                return create_binary_response_from_blob(radial_blob, is_gzipped=gzip_enabled)
+            return jsonify({"error": "JSON format disabled for memory optimization. Use format=binary"})
+
         _, compressed_blob, _ = _get_or_build_radar_blob(
             site_id=site_id,
             product=product,
             source=source,
             specific_key=specific_key,
             gzip_enabled=gzip_enabled,
+            debug=debug_enabled,
         )
 
         if format_type == 'binary':
@@ -2253,10 +2517,15 @@ def get_radar_data_webgl_batch(site_id):
     payload = request.get_json(silent=True) or {}
     product = str(payload.get('product') or 'N0B').strip().upper()
     source = _normalize_radar_source(payload.get('source', 'level3'))
+    transport = str(payload.get('transport') or '').strip().lower()
     gzip_enabled = bool(payload.get('gzip', False))
-    include_payload = bool(payload.get('includePayload', True))
+    debug_enabled = bool(payload.get('debug', False))
+    include_payload = bool(payload.get('includePayload', RADAR_BATCH_DEFAULT_INCLUDE_PAYLOAD))
     keys = payload.get('keys') or []
     max_workers = int(payload.get('maxWorkers') or RADAR_BATCH_MAX_WORKERS)
+
+    if not transport:
+        transport = 'radial' if source == 'level3' else 'triangles'
 
     if not isinstance(keys, list) or not keys:
         return jsonify({"error": "Request body must include a non-empty keys array."}), 400
@@ -2272,6 +2541,8 @@ def get_radar_data_webgl_batch(site_id):
     started = time.time()
 
     try:
+        _ensure_radial_watcher_started()
+        _register_radial_watch_target(site_id, product, source)
         cleanup_temp_files()
     except Exception:
         pass
@@ -2279,13 +2550,25 @@ def get_radar_data_webgl_batch(site_id):
     def _process(single_key):
         item_start = time.time()
         try:
-            resolved_key, blob, cache_hit = _get_or_build_radar_blob(
-                site_id=site_id,
-                product=product,
-                source=source,
-                specific_key=single_key,
-                gzip_enabled=gzip_enabled,
-            )
+            use_radial = transport in ('radial', 'mesh-values', 'mesh_values')
+            if use_radial:
+                resolved_key, blob, cache_hit = _get_or_build_radar_radial_blob(
+                    site_id=site_id,
+                    product=product,
+                    source=source,
+                    specific_key=single_key,
+                    gzip_enabled=gzip_enabled,
+                    debug=debug_enabled,
+                )
+            else:
+                resolved_key, blob, cache_hit = _get_or_build_radar_blob(
+                    site_id=site_id,
+                    product=product,
+                    source=source,
+                    specific_key=single_key,
+                    gzip_enabled=gzip_enabled,
+                    debug=debug_enabled,
+                )
 
             result = {
                 "key": resolved_key,
@@ -2357,11 +2640,10 @@ def generate_binary_blob(vertices, values, use_gzip=False):
     # 3. Values
     binary_data.extend(values_array.tobytes())
 
-    payload = bytes(binary_data)
     if use_gzip:
         # Favor speed over max compression ratio for lower request latency.
-        return gzip.compress(payload, compresslevel=1)
-    return payload
+        return gzip.compress(binary_data, compresslevel=1)
+    return binary_data
 
 
 def create_binary_response_from_blob(payload_bytes, extra_headers=None, is_gzipped=False):
@@ -2386,7 +2668,7 @@ def _build_radar_cache_key(site_id, product, source, key, file_size, file_mtime,
     return f"{source}:{site_id}:{product}:{key}:{int(file_size)}:{float(file_mtime):.6f}:gzip{int(bool(gzip_enabled))}"
 
 
-def _resolve_radar_file(site_id, product, source, specific_key):
+def _resolve_radar_file(site_id, product, source, specific_key, use_cache=True):
     if source == 'level2':
         if specific_key:
             key = os.path.basename(specific_key)
@@ -2397,17 +2679,181 @@ def _resolve_radar_file(site_id, product, source, specific_key):
     else:
         if specific_key:
             key = specific_key
-            radar_file_path = download_radar_file_by_key(specific_key)
+            radar_file_path = download_radar_file_by_key(specific_key, use_cache=use_cache)
         else:
             key = get_latest_radar_key(site_id, product)
-            radar_file_path = download_radar_file_by_key(key)
+            radar_file_path = download_radar_file_by_key(key, use_cache=use_cache)
     return key, radar_file_path
 
 
-def _decode_to_webgl_arrays(radar_file_path, site_id, product, source):
+def _invalidate_level3_cached_file_for_key(key):
+    try:
+        temp_path = Path("./temp") / key
+        if not temp_path.exists():
+            return
+        for attempt in range(4):
+            try:
+                temp_path.unlink(missing_ok=True)
+                return
+            except PermissionError:
+                if attempt >= 3:
+                    return
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        return
+
+
+def _radial_prefetch_failure_entry_key(site_id, product, key):
+    return f"{site_id.upper()}|{str(product or '').upper()}|{key}"
+
+
+def _should_skip_radial_prefetch(site_id, product, key):
+    failure_key = _radial_prefetch_failure_entry_key(site_id, product, key)
+    now = time.time()
+    with radial_prefetch_failures_lock:
+        expires_at = radial_prefetch_failures.get(failure_key)
+        if not expires_at:
+            return False
+        if now >= expires_at:
+            radial_prefetch_failures.pop(failure_key, None)
+            return False
+        return True
+
+
+def _mark_radial_prefetch_failure(site_id, product, key):
+    failure_key = _radial_prefetch_failure_entry_key(site_id, product, key)
+    with radial_prefetch_failures_lock:
+        radial_prefetch_failures[failure_key] = time.time() + RADIAL_PREFETCH_FAILURE_BACKOFF_SEC
+
+
+def _clear_radial_prefetch_failure(site_id, product, key):
+    failure_key = _radial_prefetch_failure_entry_key(site_id, product, key)
+    with radial_prefetch_failures_lock:
+        radial_prefetch_failures.pop(failure_key, None)
+
+
+def _safe_debug_value(value, max_list_items=16):
+    """Convert parser objects to JSON-safe debug values without huge payloads."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, (np.integer, np.floating)):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        flat = value.ravel()
+        head = flat[:max_list_items].tolist()
+        return {
+            "type": "ndarray",
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "sample": [_safe_debug_value(v) for v in head],
+        }
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {"type": type(value).__name__, "length": len(value)}
+    if isinstance(value, dict):
+        out = {}
+        count = 0
+        for k, v in value.items():
+            if count >= max_list_items:
+                out["_truncated"] = True
+                break
+            out[str(k)] = _safe_debug_value(v, max_list_items=max_list_items)
+            count += 1
+        return out
+    if isinstance(value, (list, tuple)):
+        out = [_safe_debug_value(v, max_list_items=max_list_items) for v in value[:max_list_items]]
+        if len(value) > max_list_items:
+            out.append("...truncated...")
+        return out
+
+    # Lightweight object introspection (non-callable public attrs only).
+    if hasattr(value, "__dict__"):
+        out = {}
+        count = 0
+        for attr in sorted(dir(value)):
+            if attr.startswith("_"):
+                continue
+            if count >= max_list_items:
+                out["_truncated"] = True
+                break
+            try:
+                attr_val = getattr(value, attr)
+                if callable(attr_val):
+                    continue
+                out[attr] = _safe_debug_value(attr_val, max_list_items=max_list_items)
+                count += 1
+            except Exception:
+                continue
+        return out
+
+    return str(value)
+
+
+def _extract_parser_field(radar_data, *names):
+    for name in names:
+        if not name:
+            continue
+        try:
+            if isinstance(radar_data, dict) and name in radar_data:
+                return radar_data.get(name)
+            if hasattr(radar_data, name):
+                return getattr(radar_data, name)
+        except Exception:
+            continue
+    return None
+
+
+def _log_nexrad_debug_snapshot(radar_data, site_id, product, source, key, radar_file_path):
+    """Console-log rich parser details similar to frontend object inspection."""
+    try:
+        header = _extract_parser_field(radar_data, "header")
+        prod_desc = _extract_parser_field(radar_data, "prod_desc", "productDescription")
+        metadata = _extract_parser_field(radar_data, "metadata")
+
+        snapshot = {
+            "site_id": site_id,
+            "station": _extract_parser_field(radar_data, "station", "siteID") or site_id,
+            "product": str(product or "").upper(),
+            "source": source,
+            "s3_key": key,
+            "filename": os.path.basename(radar_file_path or ""),
+            "file_path": radar_file_path,
+            "file_size": os.path.getsize(radar_file_path) if radar_file_path and os.path.exists(radar_file_path) else None,
+            "parser_class": type(radar_data).__name__,
+            "nexrad_level": _extract_parser_field(radar_data, "nexrad_level", "level"),
+            "product_code": _extract_parser_field(radar_data, "product_code", "code"),
+            "product_abbv": _extract_parser_field(radar_data, "product_abbv", "productAbbreviation"),
+            "product_name": _extract_parser_field(radar_data, "product_name", "productName"),
+            "elevation_angle": _extract_parser_field(radar_data, "elevation_angle", "el_angle"),
+            "vcp": _extract_parser_field(radar_data, "vcp"),
+            "lat": _extract_parser_field(radar_data, "lat", "latitude"),
+            "lon": _extract_parser_field(radar_data, "lon", "longitude"),
+            "height": _extract_parser_field(radar_data, "height", "altitude"),
+            "header": _safe_debug_value(header),
+            "prod_desc": _safe_debug_value(prod_desc),
+            "metadata": _safe_debug_value(metadata),
+            "text_header": _safe_debug_value(_extract_parser_field(radar_data, "text_header")),
+            "thresholds": _safe_debug_value(_extract_parser_field(radar_data, "thresholds")),
+            "sym_block": _safe_debug_value(_extract_parser_field(radar_data, "sym_block"), max_list_items=6),
+            "initial_radar_obj": {
+                "class": type(_extract_parser_field(radar_data, "initial_radar_obj")).__name__
+                if _extract_parser_field(radar_data, "initial_radar_obj") is not None else None
+            },
+        }
+
+        # One compact JSON line for backend logs and easy copy/paste.
+        print("[NEXRAD_DEBUG] " + json.dumps(snapshot, default=str))
+    except Exception as log_err:
+        print(f"[NEXRAD_DEBUG] Failed to emit snapshot: {log_err}")
+
+
+def _decode_to_webgl_arrays(radar_file_path, site_id, product, source, key=None, debug=False):
     if source == 'level2':
         import nexrad_level2
         radar_data = nexrad_level2.NEXRADLevel2File(radar_file_path)
+        if debug:
+            _log_nexrad_debug_snapshot(radar_data, site_id, product, source, key, radar_file_path)
         try:
             azimuths, ranges, radar_values = _extract_level2_radar_data(radar_data, product)
             if azimuths is None or ranges is None or radar_values is None:
@@ -2429,10 +2875,247 @@ def _decode_to_webgl_arrays(radar_file_path, site_id, product, source):
         radar_data = nexrad.Level3File(radar_file_path)
     else:
         radar_data = nexrad.Level2File(radar_file_path)
+    if debug:
+        _log_nexrad_debug_snapshot(radar_data, site_id, product, source, key, radar_file_path)
     return convert_radar_to_webgl_data(radar_data, site_id, product)
 
 
-def _get_or_build_radar_blob(site_id, product, source, specific_key=None, gzip_enabled=False):
+def _normalize_radial_arrays(azimuths, ranges, radar_values):
+    if azimuths is None or ranges is None or radar_values is None:
+        raise ValueError("Missing radial arrays")
+
+    az = np.asarray(azimuths, dtype=np.float32).reshape(-1)
+    rg = np.asarray(ranges, dtype=np.float32).reshape(-1)
+    vals = np.asarray(radar_values, dtype=np.float32)
+
+    if vals.ndim == 1:
+        vals = vals.reshape(1, -1)
+    elif vals.ndim > 2:
+        vals = vals.reshape(vals.shape[0], -1)
+
+    n_az = min(len(az), vals.shape[0]) if vals.size else 0
+    n_rg = min(len(rg), vals.shape[1]) if vals.size else 0
+    if n_az <= 0 or n_rg <= 1:
+        raise ValueError("Insufficient radial dimensions")
+
+    az = az[:n_az]
+    rg = rg[:n_rg]
+    vals = vals[:n_az, :n_rg]
+
+    # Canonicalize ray ordering so client mesh can be reused across scans.
+    # This prevents constant mesh rebuilds when source rays arrive in rotated order.
+    if n_az > 1:
+        az = np.mod(az, np.float32(360.0)).astype(np.float32, copy=False)
+        order = np.argsort(az, kind='mergesort')
+        az = az[order]
+        vals = vals[order, :]
+
+    # Normalize invalid placeholders to NaN for client-side masking.
+    vals = vals.astype(np.float32, copy=False)
+    vals[~np.isfinite(vals)] = np.float32(np.nan)
+
+    return az, rg, vals
+
+
+def _decode_to_radial_arrays(radar_file_path, site_id, product, source, key=None, debug=False):
+    if source == 'level2':
+        import nexrad_level2
+        radar_data = nexrad_level2.NEXRADLevel2File(radar_file_path)
+        if debug:
+            _log_nexrad_debug_snapshot(radar_data, site_id, product, source, key, radar_file_path)
+        try:
+            azimuths, ranges, radar_values = _extract_level2_radar_data(radar_data, product)
+            return _normalize_radial_arrays(azimuths, ranges, radar_values)
+        finally:
+            try:
+                radar_data.close()
+            except Exception:
+                pass
+
+    if product.startswith('N0'):
+        radar_data = nexrad.Level3File(radar_file_path)
+    else:
+        radar_data = nexrad.Level2File(radar_file_path)
+    if debug:
+        _log_nexrad_debug_snapshot(radar_data, site_id, product, source, key, radar_file_path)
+
+    azimuths, ranges, radar_values = extract_radar_data(radar_data)
+    return _normalize_radial_arrays(azimuths, ranges, radar_values)
+
+
+def generate_radial_binary_blob(site_id, product, source, key, azimuths, ranges, values, use_gzip=False):
+    az = np.asarray(azimuths, dtype=np.float32).reshape(-1)
+    rg = np.asarray(ranges, dtype=np.float32).reshape(-1)
+    vals = np.asarray(values, dtype=np.float32)
+
+    num_az = int(az.shape[0])
+    num_rg = int(rg.shape[0])
+    if vals.ndim != 2 or vals.shape[0] != num_az or vals.shape[1] != num_rg:
+        raise ValueError("Radial values shape mismatch")
+
+    mesh_id = (
+        f"{site_id.upper()}|{str(product or '').upper()}|{source}|"
+        f"{num_az}|{num_rg}|{float(rg[0]) if num_rg else 0.0:.3f}|"
+        f"{float((rg[1]-rg[0]) if num_rg>1 else 0.0):.3f}"
+    )
+    mesh_id_bytes = mesh_id.encode('utf-8')
+    if len(mesh_id_bytes) > 65535:
+        raise ValueError("mesh_id too large")
+
+    flags = 1 if use_gzip else 0
+    header = bytearray()
+    header.extend(struct.pack('<I', RADIAL_MAGIC))
+    header.extend(struct.pack('<H', RADIAL_PROTOCOL_VERSION))
+    header.extend(struct.pack('<H', flags))
+    header.extend(struct.pack('<I', num_az))
+    header.extend(struct.pack('<I', num_rg))
+    header.extend(struct.pack('<H', len(mesh_id_bytes)))
+    header.extend(struct.pack('<H', 0))
+    header.extend(mesh_id_bytes)
+
+    header.extend(az.tobytes(order='C'))
+    header.extend(rg.tobytes(order='C'))
+    header.extend(vals.astype(np.float32, copy=False).tobytes(order='C'))
+
+    if use_gzip:
+        return gzip.compress(header, compresslevel=1), mesh_id
+    return header, mesh_id
+
+
+def _build_radial_scan_cache_key(site_id, product, key):
+    return f"{site_id.upper()}:{str(product or '').upper()}:{key}"
+
+
+def _register_radial_watch_target(site_id, product, source):
+    normalized = (site_id.upper(), str(product or '').upper(), source)
+    with radial_watch_registry_lock:
+        radial_watch_registry.add(normalized)
+
+
+def _prefetch_latest_radial_for_target(site_id, product, source='level3'):
+    try:
+        if source != 'level3':
+            return
+        key = get_latest_radar_key(site_id, product)
+        if _should_skip_radial_prefetch(site_id, product, key):
+            return
+        cache_key = _build_radial_scan_cache_key(site_id, product, key)
+        with radial_scan_cache_lock:
+            if cache_key in radial_scan_cache:
+                radial_scan_cache.move_to_end(cache_key)
+                _clear_radial_prefetch_failure(site_id, product, key)
+                return
+        _get_or_build_radar_radial_blob(
+            site_id=site_id,
+            product=product,
+            source=source,
+            specific_key=key,
+            gzip_enabled=False,
+            debug=False,
+        )
+        _clear_radial_prefetch_failure(site_id, product, key)
+    except Exception as watcher_err:
+        try:
+            _mark_radial_prefetch_failure(site_id, product, key)
+        except Exception:
+            pass
+        print(f"[RADIAL_WATCHER] prefetch failed for {site_id}/{product}: {watcher_err}")
+
+
+def _radial_watch_loop():
+    while True:
+        try:
+            with radial_watch_registry_lock:
+                targets = list(radial_watch_registry)
+            for site_id, product, source in targets:
+                _prefetch_latest_radial_for_target(site_id, product, source)
+        except Exception as err:
+            print(f"[RADIAL_WATCHER] loop error: {err}")
+        time.sleep(RADIAL_WATCHER_INTERVAL_SEC)
+
+
+def _ensure_radial_watcher_started():
+    global radial_watch_thread_started
+    if radial_watch_thread_started:
+        return
+    radial_watch_thread_started = True
+    watcher = Thread(target=_radial_watch_loop, daemon=True, name="radial-prefetch-watcher")
+    watcher.start()
+    print("[RADIAL_WATCHER] Started background radial prefetch watcher")
+
+
+def _get_or_build_radar_radial_blob(site_id, product, source, specific_key=None, gzip_enabled=False, debug=False):
+    last_err = None
+
+    # First pass: normal cache usage; second pass (if needed): force redownload for Level-3.
+    for attempt in range(2):
+        force_refresh_level3 = (attempt == 1 and source == 'level3')
+        key, radar_file_path = _resolve_radar_file(
+            site_id,
+            product,
+            source,
+            specific_key,
+            use_cache=not force_refresh_level3,
+        )
+
+        scan_cache_key = _build_radial_scan_cache_key(site_id, product, key)
+        with radial_scan_cache_lock:
+            cached = radial_scan_cache.get(scan_cache_key)
+            if cached and bool(cached.get('gzip')) == bool(gzip_enabled):
+                radial_scan_cache.move_to_end(scan_cache_key)
+                return key, cached['blob'], True
+
+        try:
+            az, rg, vals = _decode_to_radial_arrays(
+                radar_file_path=radar_file_path,
+                site_id=site_id,
+                product=product,
+                source=source,
+                key=key,
+                debug=debug,
+            )
+            blob, mesh_id = generate_radial_binary_blob(
+                site_id=site_id,
+                product=product,
+                source=source,
+                key=key,
+                azimuths=az,
+                ranges=rg,
+                values=vals,
+                use_gzip=gzip_enabled,
+            )
+
+            with radial_scan_cache_lock:
+                radial_scan_cache[scan_cache_key] = {
+                    'blob': blob,
+                    'mesh_id': mesh_id,
+                    'gzip': bool(gzip_enabled),
+                    'cached_at': time.time(),
+                }
+                radial_scan_cache.move_to_end(scan_cache_key)
+                _enforce_lru_limits(
+                    radial_scan_cache,
+                    max_items=RADIAL_SCAN_CACHE_MAX_SIZE,
+                    max_bytes=RADIAL_SCAN_CACHE_MAX_BYTES,
+                    entry_size_bytes=_radial_entry_size_bytes,
+                )
+
+            return key, blob, False
+        except Exception as err:
+            last_err = err
+            if source != 'level3' or attempt >= 1:
+                break
+
+            # Suspect a bad cached local Level-3 file; invalidate and retry once.
+            with radial_scan_cache_lock:
+                radial_scan_cache.pop(scan_cache_key, None)
+            _invalidate_level3_cached_file_for_key(key)
+            print(f"[RADIAL] decode failed for {key}; retrying with forced re-download: {err}")
+
+    raise last_err if last_err is not None else RuntimeError("Failed to build radial blob")
+
+
+def _get_or_build_radar_blob(site_id, product, source, specific_key=None, gzip_enabled=False, debug=False):
     key, radar_file_path = _resolve_radar_file(site_id, product, source, specific_key)
 
     file_stats = os.stat(radar_file_path)
@@ -2473,6 +3156,8 @@ def _get_or_build_radar_blob(site_id, product, source, specific_key=None, gzip_e
             site_id=site_id,
             product=product,
             source=source,
+            key=key,
+            debug=debug,
         )
         blob = generate_binary_blob(vertices, values, use_gzip=gzip_enabled)
 
@@ -2485,8 +3170,12 @@ def _get_or_build_radar_blob(site_id, product, source, specific_key=None, gzip_e
         with processed_data_lock:
             processed_data_cache[cache_key] = blob
             processed_data_cache.move_to_end(cache_key)
-            while len(processed_data_cache) > PROCESSED_CACHE_MAX_SIZE:
-                processed_data_cache.popitem(last=False)
+            _enforce_lru_limits(
+                processed_data_cache,
+                max_items=PROCESSED_CACHE_MAX_SIZE,
+                max_bytes=PROCESSED_CACHE_MAX_BYTES,
+                entry_size_bytes=_processed_blob_size_bytes,
+            )
 
         gc.collect()
         return key, blob, False
@@ -2996,8 +3685,12 @@ def _get_model_processed(model, variable, forecast_hour, target_date=None, targe
         with hrrr_processed_cache_lock:
             hrrr_processed_cache[cache_key] = (vertices, values, meta)
             hrrr_processed_cache.move_to_end(cache_key)
-            while len(hrrr_processed_cache) > HRRR_PROCESSED_CACHE_MAX_SIZE:
-                hrrr_processed_cache.popitem(last=False)
+            _enforce_lru_limits(
+                hrrr_processed_cache,
+                max_items=HRRR_PROCESSED_CACHE_MAX_SIZE,
+                max_bytes=HRRR_PROCESSED_CACHE_MAX_BYTES,
+                entry_size_bytes=_hrrr_entry_size_bytes,
+            )
 
         with model_last_successful_runs_lock:
             model_last_successful_runs[model_name] = {
@@ -3219,8 +3912,12 @@ def _get_model_processed(model, variable, forecast_hour, target_date=None, targe
     with hrrr_processed_cache_lock:
         hrrr_processed_cache[cache_key] = (vertices, values, meta)
         hrrr_processed_cache.move_to_end(cache_key)
-        while len(hrrr_processed_cache) > HRRR_PROCESSED_CACHE_MAX_SIZE:
-            hrrr_processed_cache.popitem(last=False)
+        _enforce_lru_limits(
+            hrrr_processed_cache,
+            max_items=HRRR_PROCESSED_CACHE_MAX_SIZE,
+            max_bytes=HRRR_PROCESSED_CACHE_MAX_BYTES,
+            entry_size_bytes=_hrrr_entry_size_bytes,
+        )
 
     with model_last_successful_runs_lock:
         model_last_successful_runs[model_name] = {
@@ -3651,6 +4348,7 @@ def get_cameras():
 
 
 if __name__ == '__main__':
+    _ensure_radial_watcher_started()
     print("=" * 60)
     print("🌦️  RadarApp Flask Backend Starting...")
     print("=" * 60)
