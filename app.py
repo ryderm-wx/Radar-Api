@@ -2466,9 +2466,9 @@ def get_radar_data_webgl(site_id):
     specific_key = request.args.get('key', None)  # Optional: specific radar file key
     source = _normalize_radar_source(request.args.get('source', 'level3'))
 
-    # Keep Level-3 binary on the radial protocol unless explicitly overridden.
+    # Backward-compatible default: triangle payload unless transport is explicit.
     if not transport:
-        transport = 'radial' if (source == 'level3' and format_type == 'binary') else 'triangles'
+        transport = 'triangles'
 
     try:
         # Aggressive temp cleanup to avoid disk bloat on constrained hosts
@@ -2525,7 +2525,7 @@ def get_radar_data_webgl_batch(site_id):
     max_workers = int(payload.get('maxWorkers') or RADAR_BATCH_MAX_WORKERS)
 
     if not transport:
-        transport = 'radial' if source == 'level3' else 'triangles'
+        transport = 'triangles'
 
     if not isinstance(keys, list) or not keys:
         return jsonify({"error": "Request body must include a non-empty keys array."}), 400
