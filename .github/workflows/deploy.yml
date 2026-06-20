@@ -20,6 +20,9 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           tmp_dir="$(mktemp -d)"
+          askpass_script="$(mktemp)"
+          trap 'rm -rf "$tmp_dir" "$askpass_script"' EXIT
+
           rsync -a --delete \
             --exclude '.git' \
             --exclude '__pycache__/' \
@@ -34,5 +37,15 @@ jobs:
           git config user.name "GitHub Actions"
           git add .
           git commit -m "Sync from GitHub Actions"
-          hf_repo_url="https://RyderM-WX:${HF_TOKEN}@huggingface.co/spaces/RyderM-WX/Radar-api"
-          git push --force "$hf_repo_url" main
+
+          cat > "$askpass_script" <<'EOF'
+          #!/usr/bin/env bash
+          case "$1" in
+            *Username*) echo "RyderM-WX" ;;
+            *Password*) echo "$HF_TOKEN" ;;
+          esac
+          EOF
+          chmod 700 "$askpass_script"
+
+          GIT_ASKPASS="$askpass_script" GIT_TERMINAL_PROMPT=0 \
+            git push --force https://huggingface.co/spaces/RyderM-WX/Radar-api main
