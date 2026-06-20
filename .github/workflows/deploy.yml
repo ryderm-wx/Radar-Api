@@ -19,7 +19,20 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          git config --global user.email "actions@github.com"
-          git config --global user.name "GitHub Actions"
-          # Force push your GitHub main branch to the Hugging Face Space repository
-          git push --force https://RyderM-WX:$HF_TOKEN@huggingface.co/spaces/RyderM-WX/Radar-api main
+          tmp_dir="$(mktemp -d)"
+          rsync -a --delete \
+            --exclude '.git' \
+            --exclude '__pycache__/' \
+            --exclude '*.pyc' \
+            --exclude 'temp/' \
+            ./ "$tmp_dir/"
+
+          cd "$tmp_dir"
+          git init
+          git checkout -b main
+          git config user.email "actions@github.com"
+          git config user.name "GitHub Actions"
+          git add .
+          git commit -m "Sync from GitHub Actions"
+          hf_repo_url="https://RyderM-WX:${HF_TOKEN}@huggingface.co/spaces/RyderM-WX/Radar-api"
+          git push --force "$hf_repo_url" main
