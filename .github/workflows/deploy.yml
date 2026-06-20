@@ -36,7 +36,7 @@ jobs:
           git config user.email "actions@github.com"
           git config user.name "GitHub Actions"
           git add .
-          git commit -m "Sync from GitHub Actions"
+          git commit -m "Sync from GitHub Actions (commit: ${GITHUB_SHA})"
 
           cat > "$askpass_script" <<'EOF'
           #!/usr/bin/env bash
@@ -45,7 +45,7 @@ jobs:
             *Password*) echo "$HF_TOKEN" ;;
           esac
           EOF
-          chmod 700 "$askpass_script"
+          chmod 500 "$askpass_script"
 
           GIT_ASKPASS="$askpass_script" GIT_TERMINAL_PROMPT=0 \
             git push --force https://huggingface.co/spaces/RyderM-WX/Radar-api main
